@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 # System deps: ffmpeg for opus, sox optional (useful if you ever need it)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg sox libsox-fmt-all libsndfile1 \
+    ffmpeg sox libsox-fmt-all libsndfile1 libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
