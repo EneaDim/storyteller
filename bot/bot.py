@@ -14,6 +14,8 @@ logger = setup_logging("bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_URL = os.environ["API_URL"].rstrip("/")
+if not API_URL.startswith(("http://", "https://")):
+    API_URL = "https://" + API_URL
 
 # ---- state keys ----
 K_MODE = "mode"          # "story" | "podcast"
