@@ -75,7 +75,7 @@ def tts_line(text: str, voice_desc: str, language: str):
         language=language,
         instruct=voice_desc,
         non_streaming_mode=True,
-        max_new_tokens=1024,
+        max_new_tokens=256,
     )
     return wavs[0].astype(np.float32), int(sr)
 
