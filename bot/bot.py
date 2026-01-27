@@ -156,10 +156,16 @@ async def generate_and_send_voice(update: Update, context: ContextTypes.DEFAULT_
             endpoint = f"{API_URL}/voice/mono"
             timeout = 240
         else:
-            dialogue_text = build_podcast_dialogue(topic)
-            payload = {"text": dialogue_text, "language": lang, "pause_s": 0.18}
-            endpoint = f"{API_URL}/voice/dialogue"
-            timeout = 360
+            podcast_text = (
+                "Podcast (host Quinn) su: " + topic + "
+
+"
+                "Oggi ti do 3 punti chiave, un esempio pratico e una conclusione. "
+                "Partiamo dal contesto, poi andiamo al sodo..."
+            )
+            payload = {"text": podcast_text, "language": lang, "speaker": "B"}
+            endpoint = f"{API_URL}/voice/mono"
+            timeout = 240
 
         dbg(logger, f"[BOT] request {endpoint} mode={mode} chars={len(payload['text'])}")
         r = requests.post(endpoint, json=payload, timeout=timeout)
