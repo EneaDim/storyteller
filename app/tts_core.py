@@ -1,4 +1,3 @@
-# app/tts_core.py
 import os
 import re
 from typing import List, Tuple, Optional
@@ -17,8 +16,12 @@ TTS_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 SPEAKER_A = "Vivian"
 SPEAKER_B = "Aiden"
 
-# OFF by default to avoid OOM on small instances (Railway)
+# OFF by default to avoid OOM peaks on small instances
 ENABLE_CPU_QUANT = os.getenv("ENABLE_CPU_QUANT", "0") == "1"
+
+# Chunking (keep it simple)
+MAX_CHARS_PER_CHUNK = 260
+PAUSE_BETWEEN_CHUNKS_S = 0.12
 
 TTS: Optional[Qwen3TTSModel] = None
 
@@ -34,11 +37,9 @@ def load_tts() -> Qwen3TTSModel:
         dtype=torch.bfloat16 if use_cuda else torch.float32,
     )
 
-    # Optional CPU-only quantization (can OOM during quantize step)
     if (not use_cuda) and ENABLE_CPU_QUANT:
         from torch.quantization import quantize_dynamic
         import torch.nn as nn
-
         dbg(logger, "[INIT] Applying dynamic int8 quantization on CPU...")
         model = quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
         dbg(logger, "[INIT] Quantization done.")
@@ -89,7 +90,31 @@ def _speaker_for_tag(tag: str) -> str:
     return SPEAKER_B if tag.upper() == "B" else SPEAKER_A
 
 
-def tts_line(text: str, language: str, speaker: str, max_new_tokens: int = 64) -> Tuple[np.ndarray, int]:
+def _split_sentences(text: str) -> List[str]:
+    # keep punctuation with the sentence
+    # Works ok for Italian; minimal and dependency-free.
+    parts = re.split(r"(?<=[\.\!\?\:;])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _pack_chunks(sentences: List[str], max_chars: int) -> List[str]:
+    chunks: List[str] = []
+    cur = ""
+    for s in sentences:
+        if not cur:
+            cur = s
+            continue
+        if len(cur) + 1 + len(s) <= max_chars:
+            cur = cur + " " + s
+        else:
+            chunks.append(cur)
+            cur = s
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def tts_line(text: str, language: str, speaker: str, max_new_tokens: int = 256) -> Tuple[np.ndarray, int]:
     model = ensure_tts()
     with torch.inference_mode():
         wavs, sr = model.generate_custom_voice(
@@ -101,14 +126,38 @@ def tts_line(text: str, language: str, speaker: str, max_new_tokens: int = 64) -
         )
     return wavs[0].astype(np.float32), int(sr)
 
+
 def synthesize_mono(text: str, language: str, voice: str = "A"):
     text = clean_for_tts(text)
     speaker = _speaker_for_tag(voice)
-    dbg(logger, f"[TTS] mono speaker={speaker} chars={len(text)}")
 
-    audio, sr = tts_line(text, language, speaker)
-    audio = normalize_peak(audio, 0.95)
-    return text, audio, sr
+    # Chunk the text
+    sents = _split_sentences(text)
+    chunks = _pack_chunks(sents, MAX_CHARS_PER_CHUNK) if sents else []
+    if not chunks:
+        chunks = [text] if text else [""]
+
+    dbg(logger, f"[TTS] mono speaker={speaker} chars={len(text)} chunks={len(chunks)}")
+
+    parts: List[np.ndarray] = []
+    sr_ref: Optional[int] = None
+
+    for i, chunk in enumerate(chunks, start=1):
+        dbg(logger, f"[TTS] chunk {i}/{len(chunks)} chars={len(chunk)}")
+        audio, sr = tts_line(chunk, language, speaker)
+
+        if sr_ref is None:
+            sr_ref = sr
+        elif sr != sr_ref:
+            raise RuntimeError(f"Sample-rate mismatch: {sr} vs {sr_ref}")
+
+        parts.append(audio)
+        if i != len(chunks):
+            parts.append(add_silence(sr_ref, PAUSE_BETWEEN_CHUNKS_S))
+
+    full = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+    full = normalize_peak(full, 0.95)
+    return text, full, (sr_ref or 24000)
 
 
 def synthesize_dialogue(text: str, language: str, pause_s: float = 0.18):
