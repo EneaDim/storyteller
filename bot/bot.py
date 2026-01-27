@@ -153,15 +153,14 @@ async def generate_and_send_voice(update: Update, context: ContextTypes.DEFAULT_
     lang = context.user_data.get(K_LANG, "Italian")
 
     try:
+        timeout = 5240
         if mode == "story":
             payload = {"text": topic, "language": lang, "speaker": "A"}  # A/B tag
             endpoint = f"{API_URL}/voice/mono"
-            timeout = 240
         else:
             dialogue_text = build_podcast_dialogue(topic)  # A: ... \n B: ...
             payload = {"text": dialogue_text, "language": lang, "pause_s": 0.18}
             endpoint = f"{API_URL}/voice/dialogue"
-            timeout = 240
 
         dbg(logger, f"[BOT] request {endpoint} mode={mode} chars={len(payload['text'])}")
 

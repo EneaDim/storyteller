@@ -89,7 +89,7 @@ def _speaker_for_tag(tag: str) -> str:
     return SPEAKER_B if tag.upper() == "B" else SPEAKER_A
 
 
-def tts_line(text: str, language: str, speaker: str, max_new_tokens: int = 256) -> Tuple[np.ndarray, int]:
+def tts_line(text: str, language: str, speaker: str, max_new_tokens: int = 64) -> Tuple[np.ndarray, int]:
     model = ensure_tts()
     with torch.inference_mode():
         wavs, sr = model.generate_custom_voice(
