@@ -1,6 +1,8 @@
 import os
 import random
 import requests
+import asyncio
+from io import BytesIO
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -152,25 +154,27 @@ async def generate_and_send_voice(update: Update, context: ContextTypes.DEFAULT_
 
     try:
         if mode == "story":
-            payload = {"text": topic, "language": lang, "speaker": "A"}
+            payload = {"text": topic, "language": lang, "speaker": "A"}  # A/B tag
             endpoint = f"{API_URL}/voice/mono"
             timeout = 240
         else:
-            podcast_text = (
-                "Podcast (host Quinn) su: " + topic + " "
-                "Oggi ti do 3 punti chiave, un esempio pratico e una conclusione. "
-                "Partiamo dal contesto, poi andiamo al sodo..."
-            )
-            payload = {"text": podcast_text, "language": lang, "speaker": "B"}
-            endpoint = f"{API_URL}/voice/mono"
+            dialogue_text = build_podcast_dialogue(topic)  # A: ... \n B: ...
+            payload = {"text": dialogue_text, "language": lang, "pause_s": 0.18}
+            endpoint = f"{API_URL}/voice/dialogue"
             timeout = 240
 
         dbg(logger, f"[BOT] request {endpoint} mode={mode} chars={len(payload['text'])}")
-        r = requests.post(endpoint, json=payload, timeout=timeout)
-        r.raise_for_status()
 
-        # Risposta come voice message
-        await update.effective_chat.send_voice(voice=r.content)
+        def _do_request():
+            r = requests.post(endpoint, json=payload, timeout=timeout)
+            r.raise_for_status()
+            return r.content
+
+        audio_bytes = await asyncio.to_thread(_do_request)
+
+        bio = BytesIO(audio_bytes)
+        bio.name = "voice.ogg"
+        await update.effective_chat.send_voice(voice=bio)
 
     except Exception as e:
         logger.exception("generate_and_send_voice failed")
