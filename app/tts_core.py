@@ -7,7 +7,7 @@ from .logging_setup import setup_logging, dbg
 
 logger = setup_logging("tts")
 
-TTS_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+TTS_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign"
 TTS = None
 
 VOICE_A = (
@@ -25,6 +25,9 @@ VOICE_B = (
 )
 
 def load_tts():
+    from torch.quantization import quantize_dynamic
+    import torch.nn as nn
+
     dbg(logger, "[INIT] Download/load TTS model...")
     local_path = snapshot_download(TTS_ID)
     model = Qwen3TTSModel.from_pretrained(
@@ -32,6 +35,15 @@ def load_tts():
         device_map="cuda" if torch.cuda.is_available() else "cpu",
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     )
+    # CPU-only: dynamic int8 quantization (cuts RAM, speeds some ops)
+    if not torch.cuda.is_available():
+        dbg(logger, "[INIT] Applying dynamic int8 quantization on CPU...")
+        try:
+            model = quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+            dbg(logger, "[INIT] Quantization done.")
+        except Exception as e:
+            dbg(logger, f"[INIT] Quantization skipped: {e}")
+
     dbg(logger, "[INIT] TTS loaded.")
     return model
 
