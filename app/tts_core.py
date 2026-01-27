@@ -1,4 +1,5 @@
 # app/tts_core.py
+import os
 import re
 from typing import List, Tuple, Optional
 
@@ -11,22 +12,18 @@ from .logging_setup import setup_logging, dbg
 
 logger = setup_logging("tts")
 
-# Lightweight + supports generate_custom_voice
 TTS_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
-# Map A/B to built-in speakers from the CustomVoice checkpoint.
-# Change these two strings if you want different voices.
 SPEAKER_A = "Vivian"
 SPEAKER_B = "Aiden"
 
-# Global singleton
+# OFF by default to avoid OOM on small instances (Railway)
+ENABLE_CPU_QUANT = os.getenv("ENABLE_CPU_QUANT", "0") == "1"
+
 TTS: Optional[Qwen3TTSModel] = None
 
 
 def load_tts() -> Qwen3TTSModel:
-    from torch.quantization import quantize_dynamic
-    import torch.nn as nn
-
     dbg(logger, "[INIT] Download/load TTS model...")
     local_path = snapshot_download(TTS_ID)
 
@@ -37,14 +34,14 @@ def load_tts() -> Qwen3TTSModel:
         dtype=torch.bfloat16 if use_cuda else torch.float32,
     )
 
-    # CPU-only: dynamic int8 quantization (cuts RAM, may speed some ops)
-    if not use_cuda:
+    # Optional CPU-only quantization (can OOM during quantize step)
+    if (not use_cuda) and ENABLE_CPU_QUANT:
+        from torch.quantization import quantize_dynamic
+        import torch.nn as nn
+
         dbg(logger, "[INIT] Applying dynamic int8 quantization on CPU...")
-        try:
-            model = quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
-            dbg(logger, "[INIT] Quantization done.")
-        except Exception as e:
-            dbg(logger, f"[INIT] Quantization skipped: {e}")
+        model = quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+        dbg(logger, "[INIT] Quantization done.")
 
     dbg(logger, "[INIT] TTS loaded.")
     return model
@@ -139,4 +136,3 @@ def synthesize_dialogue(text: str, language: str, pause_s: float = 0.18):
     full = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
     full = normalize_peak(full, 0.95)
     return text, full, (sr_ref or 24000)
-
