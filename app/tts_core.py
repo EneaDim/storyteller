@@ -101,7 +101,6 @@ def tts_line(text: str, language: str, speaker: str, max_new_tokens: int = 64) -
         )
     return wavs[0].astype(np.float32), int(sr)
 
-
 def synthesize_mono(text: str, language: str, voice: str = "A"):
     text = clean_for_tts(text)
     speaker = _speaker_for_tag(voice)
