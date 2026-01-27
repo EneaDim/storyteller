@@ -157,9 +157,7 @@ async def generate_and_send_voice(update: Update, context: ContextTypes.DEFAULT_
             timeout = 240
         else:
             podcast_text = (
-                "Podcast (host Quinn) su: " + topic + "
-
-"
+                "Podcast (host Quinn) su: " + topic + " "
                 "Oggi ti do 3 punti chiave, un esempio pratico e una conclusione. "
                 "Partiamo dal contesto, poi andiamo al sodo..."
             )
