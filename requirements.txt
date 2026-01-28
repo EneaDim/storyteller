@@ -5,3 +5,5 @@ requests==2.32.3
 numpy==2.1.3
 torch
 python-telegram-bot==21.10
+
+qwen-tts
