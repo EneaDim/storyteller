@@ -1,18 +1,26 @@
 FROM python:3.12-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+WORKDIR /srv
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    ffmpeg sox libsox-fmt-all libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
+    curl ca-certificates ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install -U pip && pip install -r /app/requirements.txt
+# Install Ollama (Linux)
+RUN curl -fsSL https://ollama.com/install.sh | sh
 
-COPY . /app
+COPY requirements.txt /srv/requirements.txt
+RUN pip install --no-cache-dir -r /srv/requirements.txt
 
-CMD ["bash", "scripts/prod_api.sh"]
+COPY app /srv/app
+COPY bot /srv/bot
+COPY scripts /srv/scripts
 
+RUN mkdir -p /srv/logs /srv/tmp
+ENV PYTHONUNBUFFERED=1
+
+# IMPORTANT: model cache directory (mount a Railway Volume here)
+ENV OLLAMA_MODELS=/srv/.ollama
+
+# default command: llm+tts service entry
+CMD ["/srv/scripts/prod_api.sh"]

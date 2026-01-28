@@ -1,186 +1,120 @@
-import os
 import re
-from typing import List, Tuple, Optional
-
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
+from .audio_utils import sanitize_for_tts, trim_silence, peak_normalize
+from .logging_setup import setup_logging
+
+log = setup_logging("tts_core")
+
 from qwen_tts import Qwen3TTSModel
 
-from .logging_setup import setup_logging, dbg
-
-logger = setup_logging("tts")
-
 TTS_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+LINE_RE = re.compile(r"^\s*([AB])\s*[:\-–—]\s*(.+?)\s*$", re.IGNORECASE)
 
-SPEAKER_A = "Vivian"
-SPEAKER_B = "Aiden"
+_TTS = None
 
-# OFF by default to avoid OOM peaks on small instances
-ENABLE_CPU_QUANT = os.getenv("ENABLE_CPU_QUANT", "0") == "1"
-
-# Chunking (keep it simple)
-MAX_CHARS_PER_CHUNK = 260
-PAUSE_BETWEEN_CHUNKS_S = 0.12
-
-TTS: Optional[Qwen3TTSModel] = None
-
-
-def load_tts() -> Qwen3TTSModel:
-    dbg(logger, "[INIT] Download/load TTS model...")
-    local_path = snapshot_download(TTS_ID)
-
+def load_tts():
+    global _TTS
+    if _TTS is not None:
+        return _TTS
     use_cuda = torch.cuda.is_available()
-    model = Qwen3TTSModel.from_pretrained(
-        local_path,
+    _TTS = Qwen3TTSModel.from_pretrained(
+        TTS_ID,
         device_map="cuda" if use_cuda else "cpu",
         dtype=torch.bfloat16 if use_cuda else torch.float32,
     )
+    log.info("TTS loaded | cuda=%s", use_cuda)
+    return _TTS
 
-    if (not use_cuda) and ENABLE_CPU_QUANT:
-        from torch.quantization import quantize_dynamic
-        import torch.nn as nn
-        dbg(logger, "[INIT] Applying dynamic int8 quantization on CPU...")
-        model = quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
-        dbg(logger, "[INIT] Quantization done.")
-
-    dbg(logger, "[INIT] TTS loaded.")
-    return model
-
-
-def ensure_tts() -> Qwen3TTSModel:
-    global TTS
-    if TTS is None:
-        TTS = load_tts()
-    return TTS
-
-
-def clean_for_tts(s: str) -> str:
-    s = re.sub(r"\[[^\]]*\]", "", s, flags=re.DOTALL)
-    s = re.sub(r"\([^\)]*\)", "", s, flags=re.DOTALL)
-    s = s.replace("*", "")
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    s = re.sub(r"[ \t]{2,}", " ", s)
-    return s.strip()
-
-
-def parse_dialogue(text: str) -> List[Tuple[str, str]]:
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    pairs: List[Tuple[str, str]] = []
-    for ln in lines:
-        m = re.match(r"^([AB])\s*:\s*(.+)$", ln)
-        if not m:
-            raise ValueError(f"Invalid dialogue format line: {ln}")
-        pairs.append((m.group(1), m.group(2).strip()))
-    return pairs
-
-
-def add_silence(sr: int, seconds: float) -> np.ndarray:
-    return np.zeros(int(sr * seconds), dtype=np.float32)
-
-
-def normalize_peak(x: np.ndarray, peak: float = 0.95) -> np.ndarray:
-    m = float(np.max(np.abs(x))) if x.size else 0.0
-    if m < 1e-9:
-        return x.astype(np.float32)
-    return (x * (peak / m)).astype(np.float32)
-
-
-def _speaker_for_tag(tag: str) -> str:
-    return SPEAKER_B if tag.upper() == "B" else SPEAKER_A
-
-
-def _split_sentences(text: str) -> List[str]:
-    # keep punctuation with the sentence
-    # Works ok for Italian; minimal and dependency-free.
-    parts = re.split(r"(?<=[\.\!\?\:;])\s+", text.strip())
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _pack_chunks(sentences: List[str], max_chars: int) -> List[str]:
-    chunks: List[str] = []
-    cur = ""
-    for s in sentences:
-        if not cur:
-            cur = s
+def parse_turns(script: str):
+    turns = []
+    for raw in (script or "").splitlines():
+        raw = raw.strip()
+        if not raw:
             continue
-        if len(cur) + 1 + len(s) <= max_chars:
-            cur = cur + " " + s
+        m = LINE_RE.match(raw)
+        if m:
+            turns.append((m.group(1).upper(), m.group(2).strip()))
+    return turns
+
+def split_turns_into_4_segments(turns):
+    n_segments = 4
+    n = len(turns)
+    if n <= 0:
+        return [[] for _ in range(n_segments)]
+    base = n // n_segments
+    rem = n % n_segments
+    sizes = [(base + (1 if i < rem else 0)) for i in range(n_segments)]
+    segs, idx = [], 0
+    for sz in sizes:
+        segs.append(turns[idx:idx+sz])
+        idx += sz
+    return segs
+
+def compress_runs(segment_turns):
+    out = []
+    for spk, txt in segment_turns:
+        txt = (txt or "").strip()
+        if not txt:
+            continue
+        if not out:
+            out.append([spk, txt])
         else:
-            chunks.append(cur)
-            cur = s
-    if cur:
-        chunks.append(cur)
-    return chunks
+            if out[-1][0] == spk:
+                out[-1][1] = (out[-1][1] + " " + txt).strip()
+            else:
+                out.append([spk, txt])
+    return [(spk, txt) for spk, txt in out if txt.strip()]
 
+def tts_one(text: str, language: str, speaker: str, style_hint: str, max_new_tokens: int = 384):
+    tts = load_tts()
+    text = sanitize_for_tts(text)
 
-def tts_line(text: str, language: str, speaker: str, max_new_tokens: int = 256) -> Tuple[np.ndarray, int]:
-    model = ensure_tts()
-    with torch.inference_mode():
-        wavs, sr = model.generate_custom_voice(
-            text=text,
-            language=language,
-            speaker=speaker,
-            non_streaming_mode=True,
-            max_new_tokens=max_new_tokens,
-        )
-    return wavs[0].astype(np.float32), int(sr)
+    gen_kwargs = dict(
+        do_sample=False,
+        repetition_penalty=1.05,
+        subtalker_dosample=False,
+        max_new_tokens=int(max_new_tokens),
+    )
+    wavs, sr = tts.generate_custom_voice(
+        text=text,
+        language=language,
+        speaker=speaker,
+        instruct=style_hint or "",
+        non_streaming_mode=True,
+        **gen_kwargs,
+    )
+    wav = np.asarray(wavs[0], dtype=np.float32)
+    wav = trim_silence(wav, sr=int(sr))
+    return wav, int(sr)
 
+def synthesize_script(script: str, language: str, voice_a: str, voice_b: str, style_hint: str):
+    turns = parse_turns(script)
+    if not turns:
+        raise ValueError("No turns parsed from script")
 
-def synthesize_mono(text: str, language: str, voice: str = "A"):
-    text = clean_for_tts(text)
-    speaker = _speaker_for_tag(voice)
+    segments = split_turns_into_4_segments(turns)
 
-    # Chunk the text
-    sents = _split_sentences(text)
-    chunks = _pack_chunks(sents, MAX_CHARS_PER_CHUNK) if sents else []
-    if not chunks:
-        chunks = [text] if text else [""]
+    sr_final = None
+    pieces: list[np.ndarray] = []
 
-    dbg(logger, f"[TTS] mono speaker={speaker} chars={len(text)} chunks={len(chunks)}")
+    def add_silence(ms: int):
+        nonlocal sr_final
+        if sr_final is None or ms <= 0:
+            return
+        pieces.append(np.zeros((int(sr_final * ms / 1000.0),), dtype=np.float32))
 
-    parts: List[np.ndarray] = []
-    sr_ref: Optional[int] = None
+    for seg in segments:
+        runs = compress_runs(seg)
+        for spk, txt in runs:
+            voice = voice_a if spk == "A" else voice_b
+            wav, sr = tts_one(txt, language, voice, style_hint)
+            if sr_final is None:
+                sr_final = sr
+            pieces.append(wav)
+            add_silence(90)
+        add_silence(180)
 
-    for i, chunk in enumerate(chunks, start=1):
-        dbg(logger, f"[TTS] chunk {i}/{len(chunks)} chars={len(chunk)}")
-        audio, sr = tts_line(chunk, language, speaker)
-
-        if sr_ref is None:
-            sr_ref = sr
-        elif sr != sr_ref:
-            raise RuntimeError(f"Sample-rate mismatch: {sr} vs {sr_ref}")
-
-        parts.append(audio)
-        if i != len(chunks):
-            parts.append(add_silence(sr_ref, PAUSE_BETWEEN_CHUNKS_S))
-
-    full = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
-    full = normalize_peak(full, 0.95)
-    return text, full, (sr_ref or 24000)
-
-
-def synthesize_dialogue(text: str, language: str, pause_s: float = 0.18):
-    text = clean_for_tts(text)
-    pairs = parse_dialogue(text)
-
-    dbg(logger, f"[TTS] dialogue lines={len(pairs)}")
-    parts: List[np.ndarray] = []
-    sr_ref: Optional[int] = None
-
-    for i, (tag, line) in enumerate(pairs, start=1):
-        speaker = _speaker_for_tag(tag)
-        dbg(logger, f"[TTS] line {i}/{len(pairs)} tag={tag} speaker={speaker} chars={len(line)}")
-
-        audio, sr = tts_line(line, language, speaker)
-        if sr_ref is None:
-            sr_ref = sr
-        elif sr != sr_ref:
-            raise RuntimeError(f"Sample-rate mismatch: {sr} vs {sr_ref}")
-
-        parts.append(audio)
-        parts.append(add_silence(sr_ref, pause_s))
-
-    full = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
-    full = normalize_peak(full, 0.95)
-    return text, full, (sr_ref or 24000)
+    audio = np.concatenate([p.flatten() for p in pieces], axis=0)
+    audio = peak_normalize(audio, 0.95)
+    return sr_final, audio
