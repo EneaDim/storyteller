@@ -7,7 +7,7 @@ from .logging_setup import setup_logging
 log = setup_logging("textgen")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
 
 LINE_RE = re.compile(r"^\s*([AB])\s*[:\-–—]\s*(.+?)\s*$", re.IGNORECASE)
 
@@ -33,9 +33,6 @@ SYSTEM_PODCAST = (
 
 def _extract_dialogue_only(text: str) -> str:
     text = (text or "").strip()
-    # spezza inline A:/B:
-    text = re.sub(r"\s+(?=[AB]\s*[:\-–—])", "\n", text, flags=re.IGNORECASE)
-
     lines = []
     for raw in text.splitlines():
         raw = raw.strip()
@@ -50,7 +47,7 @@ def _extract_dialogue_only(text: str) -> str:
             lines.append(f"{spk}: {content}")
     return "\n".join(lines).strip()
 
-def generate_script(topic: str, language: str = "Italian") -> str:
+def generate_script(topic: str, language: str = "Italian", rid: str = "-") -> str:
     user = (
         f"LINGUA: {language}\n"
         f"SPUNTO (frase del giorno): {topic}\n"
@@ -68,17 +65,21 @@ def generate_script(topic: str, language: str = "Italian") -> str:
         "stream": False,
         "options": {
             "temperature": 0.6,
-            "num_predict": 900,
+            "num_predict": 700,
             "stop": ["\n\n\n", "```", "###", "SYSTEM:", "ASSISTANT:", "User:"],
         },
     }
 
+    log.info("[RID %s] ollama_chat START model=%s url=%s", rid, OLLAMA_MODEL, OLLAMA_URL)
     t0 = time.time()
     r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=300)
     r.raise_for_status()
     out = (r.json().get("message", {}) or {}).get("content", "") or ""
     dt = time.time() - t0
+    log.info("[RID %s] ollama_chat END elapsed=%.2fs raw_chars=%d", rid, dt, len(out))
 
     script = _extract_dialogue_only(out)
-    log.info("LLM done in %.2fs | chars=%d | lines=%d", dt, len(script), script.count("\n") + (1 if script else 0))
+    lines = (script.count("\n") + 1) if script else 0
+    log.info("[RID %s] script extracted lines=%d chars=%d", rid, lines, len(script or ""))
+
     return script
