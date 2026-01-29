@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-set -e
-export APP_ENV=prod
-python -m bot.bot
+set -euo pipefail
+mkdir -p logs tmp
+exec python -m bot.bot

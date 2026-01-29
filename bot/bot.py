@@ -6,6 +6,7 @@ import subprocess
 import requests
 import hashlib
 from dotenv import load_dotenv
+import socket
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -347,6 +348,13 @@ def main():
     app.add_error_handler(on_error)
 
     log.info("Bot started | env=%s | api=%s", APP_ENV, API_URL)
+    dbg("PID:", os.getpid())
+    dbg("HOSTNAME env:", os.getenv("HOSTNAME"))
+    dbg("HOSTNAME socket:", socket.gethostname())
+    dbg("RAILWAY_SERVICE_NAME:", os.getenv("RAILWAY_SERVICE_NAME"))
+    dbg("RAILWAY_DEPLOYMENT_ID:", os.getenv("RAILWAY_DEPLOYMENT_ID"))
+    dbg("RAILWAY_REPLICA_ID:", os.getenv("RAILWAY_REPLICA_ID"))
+    
     app.run_polling()
 
 if __name__ == "__main__":
