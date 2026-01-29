@@ -4,6 +4,7 @@ import time
 import tempfile
 import subprocess
 import requests
+import hashlib
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
