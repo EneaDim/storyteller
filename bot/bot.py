@@ -339,7 +339,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main():
     dbg("ENV:", "APP_ENV=", APP_ENV, "API_URL=", API_URL, "LOG_LEVEL=", LOG_LEVEL)
     app = Application.builder().token(BOT_TOKEN).build()
-
+    dbg("BOT_TOKEN sha1:", hashlib.sha1(BOT_TOKEN.encode()).hexdigest()[:8])
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
