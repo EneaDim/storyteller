@@ -1,5 +1,7 @@
+# bot/bot.py
 import os
 import time
+import tempfile
 import subprocess
 import requests
 from dotenv import load_dotenv
@@ -19,10 +21,15 @@ from app.logging_setup import setup_logging
 load_dotenv()
 log = setup_logging("telegram-bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-API_URL = os.getenv("API_URL", "").rstrip("/")
-APP_ENV = os.getenv("APP_ENV", "dev")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_URL = os.getenv("API_URL", "").strip().rstrip("/")
+APP_ENV = os.getenv("APP_ENV", "dev").strip()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+
+# Normalize API_URL (allow user to provide without scheme)
+if API_URL and not API_URL.startswith(("http://", "https://")):
+    API_URL = "https://" + API_URL
+API_URL = API_URL.rstrip("/")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing in .env")
@@ -39,15 +46,15 @@ def dbg(*args):
 CB_RANDOM = "random"
 CB_PICK = "pick"
 CB_BACK = "back"
-CB_TOPIC = "topic:"     # prefix
-CB_MORE = "more:"       # prefix page
-CB_CUSTOM = "custom"    # ask user to type phrase
+CB_TOPIC = "topic:"     # prefix + index
+CB_MORE = "more:"       # prefix + page
+CB_CUSTOM = "custom"    # ask user to type a phrase
 CB_CANCEL = "cancel"    # cancel custom input
 
 PAGE_SIZE = 8
 
 
-# ---------- UI helpers ----------
+# ---------------- UI helpers ----------------
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎲 Random", callback_data=CB_RANDOM)],
@@ -58,6 +65,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 def pick_menu_kb(topics, page: int) -> InlineKeyboardMarkup:
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, len(topics))
+
     rows = []
     for i in range(start, end):
         label = topics[i]
@@ -83,7 +91,7 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 def pretty_intro() -> str:
     return (
-        "🎧 *PodcastGen*\n"
+        "🎧 *VoiceGen*\n"
         "_Podcast narrativo a 2 voci, generato al volo._\n\n"
         "Scegli una modalità:"
     )
@@ -92,12 +100,12 @@ def pretty_done(topic: str) -> str:
     t = (topic or "").strip()
     return f"✅ *Pronto.*\n🧩 _Spunto:_ {t}"
 
-def short(s: str, n: int = 80) -> str:
+def short(s: str, n: int = 120) -> str:
     s = (s or "").replace("\n", " ")
     return s[:n] + ("…" if len(s) > n else "")
 
 
-# ---------- API ----------
+# ---------------- API calls ----------------
 def api_get_topics():
     t0 = time.time()
     r = requests.get(f"{API_URL}/topics", timeout=30)
@@ -116,17 +124,23 @@ def api_generate(topic: str | None):
     }
     dbg("api_generate -> topic:", repr(topic))
     t0 = time.time()
-    r = requests.post(f"{API_URL}/generate", json=payload, timeout=600)
+    r = requests.post(f"{API_URL}/generate", json=payload, timeout=900)
     r.raise_for_status()
     out = r.json()
-    dbg("api_generate -> done in", f"{(time.time()-t0):.2f}s",
-        "script_chars:", len(out.get("script","") or ""),
-        "audio_path:", out.get("audio_path"))
+    dbg(
+        "api_generate -> done in", f"{(time.time()-t0):.2f}s",
+        "script_chars:", len(out.get("script", "") or ""),
+        "audio_url:", out.get("audio_url"),
+        "audio_file:", out.get("audio_file"),
+    )
     return out
 
 
-# ---------- Audio conversion ----------
+# ---------------- Audio helpers ----------------
 def to_voice_ogg(input_path: str) -> str:
+    """
+    Convert to OGG/OPUS for Telegram voice note.
+    """
     base, _ = os.path.splitext(input_path)
     out_path = base + ".ogg"
     cmd = [
@@ -142,8 +156,35 @@ def to_voice_ogg(input_path: str) -> str:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out_path
 
+def download_audio(audio_url: str) -> str:
+    """
+    Download audio bytes from API and store as temp file.
+    Returns local filepath.
+    """
+    if not audio_url:
+        raise RuntimeError("audio_url missing")
 
-# ---------- Handlers ----------
+    url = API_URL.rstrip("/") + audio_url
+    dbg("download_audio ->", url)
+
+    r = requests.get(url, timeout=900)
+    r.raise_for_status()
+
+    # infer suffix if possible
+    suffix = ".m4a"
+    if audio_url.lower().endswith(".wav"):
+        suffix = ".wav"
+    elif audio_url.lower().endswith(".mp3"):
+        suffix = ".mp3"
+    elif audio_url.lower().endswith(".ogg"):
+        suffix = ".ogg"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+        f.write(r.content)
+        return f.name
+
+
+# ---------------- Telegram handlers ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dbg("/start from:", update.effective_user.id if update.effective_user else None)
     context.user_data.pop("awaiting_phrase", None)
@@ -156,30 +197,30 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     dbg("button:", data, "from:", query.from_user.id if query.from_user else None)
 
-    # CANCEL custom input
+    # Cancel custom input
     if data == CB_CANCEL:
         context.user_data.pop("awaiting_phrase", None)
         await query.edit_message_text(pretty_intro(), parse_mode="Markdown", reply_markup=main_menu_kb())
         return
 
-    # MENU
+    # Back to menu
     if data == CB_BACK:
         context.user_data.pop("awaiting_phrase", None)
         await query.edit_message_text(pretty_intro(), parse_mode="Markdown", reply_markup=main_menu_kb())
         return
 
-    # CUSTOM (ask user to type phrase)
+    # Ask for custom phrase
     if data == CB_CUSTOM:
         context.user_data["awaiting_phrase"] = True
         await query.edit_message_text(
             "✍️ *Scrivi la tua frase del giorno*\n"
-            "_Invia un messaggio con lo spunto. Poi genero il vocale._",
+            "_Invia un messaggio con lo spunto (una riga). Poi genero il vocale._",
             parse_mode="Markdown",
             reply_markup=cancel_kb(),
         )
         return
 
-    # PICK LIST
+    # Show topics list
     if data == CB_PICK:
         context.user_data.pop("awaiting_phrase", None)
         topics = context.user_data.get("topics_cache")
@@ -194,7 +235,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # PAGING
+    # Paging
     if data.startswith(CB_MORE):
         context.user_data.pop("awaiting_phrase", None)
         topics = context.user_data.get("topics_cache") or api_get_topics()
@@ -207,15 +248,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # RANDOM
+    # Random generation
     if data == CB_RANDOM:
         context.user_data.pop("awaiting_phrase", None)
         await query.edit_message_text("⏳ *Genero (random)…*", parse_mode="Markdown")
         result = api_generate(topic=None)
-        await _send_result_and_reset(query, context, result)
+        await _send_result_and_reset(query.message, result)
         return
 
-    # TOPIC SELECT
+    # Topic selected
     if data.startswith(CB_TOPIC):
         context.user_data.pop("awaiting_phrase", None)
         idx = int(data.split("topic:", 1)[1])
@@ -223,23 +264,23 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic = topics[idx]
         await query.edit_message_text("⏳ *Genero…*", parse_mode="Markdown")
         result = api_generate(topic=topic)
-        await _send_result_and_reset(query, context, result)
+        await _send_result_and_reset(query.message, result)
         return
 
     # Fallback
     context.user_data.pop("awaiting_phrase", None)
     await query.edit_message_text(pretty_intro(), parse_mode="Markdown", reply_markup=main_menu_kb())
 
-
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Riceve la frase custom quando l'utente ha premuto "Inserisci frase".
+    Receives custom phrase only if user pressed 'Inserisci frase'.
+    Otherwise ignore (button-first UX).
     """
     if not context.user_data.get("awaiting_phrase"):
-        return  # ignoriamo testi normali: UI a pulsanti
+        return
 
     phrase = (update.message.text or "").strip()
-    dbg("custom phrase received:", short(phrase, 140))
+    dbg("custom phrase received:", short(phrase, 200))
 
     context.user_data.pop("awaiting_phrase", None)
 
@@ -247,61 +288,52 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Frase vuota. Riprova dal menu.", reply_markup=main_menu_kb())
         return
 
-    # status
     await update.message.reply_text("⏳ *Genero…*", parse_mode="Markdown")
-
-    # generate
     result = api_generate(topic=phrase)
-
-    # send voice + reset menu
-    await _send_result_and_reset_msg(update, context, result)
+    await _send_result_and_reset(update.message, result)
 
 
-async def _send_result_and_reset(query, context: ContextTypes.DEFAULT_TYPE, result: dict):
+async def _send_result_and_reset(message, result: dict):
     topic = (result.get("topic") or "").strip()
-    audio_path = (result.get("audio_path") or "").strip()
+    audio_url = (result.get("audio_url") or "").strip()
 
-    await query.message.reply_text(pretty_done(topic), parse_mode="Markdown")
+    await message.reply_text(pretty_done(topic), parse_mode="Markdown")
 
-    await _send_voice_file(query.message, audio_path)
+    # Download + send as voice
+    try:
+        local_audio = download_audio(audio_url)
+        dbg("downloaded ->", local_audio)
 
-    # reset menu
-    await query.message.reply_text(pretty_intro(), parse_mode="Markdown", reply_markup=main_menu_kb())
+        # Send as Telegram voice note (prefer ogg)
+        if local_audio.lower().endswith(".ogg"):
+            voice_path = local_audio
+        else:
+            voice_path = to_voice_ogg(local_audio)
 
+        dbg("sending voice ->", voice_path)
+        with open(voice_path, "rb") as f:
+            await message.reply_voice(voice=f)
 
-async def _send_result_and_reset_msg(update: Update, context: ContextTypes.DEFAULT_TYPE, result: dict):
-    topic = (result.get("topic") or "").strip()
-    audio_path = (result.get("audio_path") or "").strip()
-
-    await update.message.reply_text(pretty_done(topic), parse_mode="Markdown")
-
-    await _send_voice_file(update.message, audio_path)
-
-    # reset menu
-    await update.message.reply_text(pretty_intro(), parse_mode="Markdown", reply_markup=main_menu_kb())
-
-
-async def _send_voice_file(message, audio_path: str):
-    if audio_path and os.path.exists(audio_path):
+    except Exception as e:
+        dbg("send voice failed:", repr(e))
+        # fallback: send as audio if we can
         try:
-            voice_path = audio_path
-            if not audio_path.lower().endswith(".ogg"):
-                voice_path = to_voice_ogg(audio_path)
-
-            dbg("sending voice:", voice_path)
-            with open(voice_path, "rb") as f:
-                await message.reply_voice(voice=f)
-
-        except Exception as e:
-            dbg("voice send failed:", repr(e))
-            try:
-                with open(audio_path, "rb") as f:
+            if 'local_audio' in locals() and os.path.exists(local_audio):
+                with open(local_audio, "rb") as f:
                     await message.reply_audio(audio=f)
-            except Exception as e2:
-                dbg("audio fallback failed:", repr(e2))
-                await message.reply_text("⚠️ Errore inviando l’audio.")
-    else:
-        await message.reply_text("⚠️ Audio non trovato sul server.")
+            else:
+                await message.reply_text("⚠️ Non riesco a recuperare/inviare l’audio.")
+        except Exception as e2:
+            dbg("audio fallback failed:", repr(e2))
+            await message.reply_text("⚠️ Errore inviando l’audio.")
+
+    # Reset to main menu (like /start)
+    await message.reply_text(pretty_intro(), parse_mode="Markdown", reply_markup=main_menu_kb())
+
+
+# ---------------- Error handler ----------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    print("[BOT][ERR]", repr(context.error), flush=True)
 
 
 def main():
@@ -310,12 +342,12 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
-
-    # intercetta testo SOLO quando siamo in modalità awaiting_phrase
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
 
     log.info("Bot started | env=%s | api=%s", APP_ENV, API_URL)
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
