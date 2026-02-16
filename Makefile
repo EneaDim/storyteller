@@ -17,10 +17,10 @@ build: ## Build immagini docker
 	docker compose --profile $(PROFILE) build
 
 up: ## Avvia stack
-	docker compose --profile $(PROFILE) up -d
+	docker compose --profile $(PROFILE) up -d --build
 
 down: ## Ferma stack (non rimuove volumi)
-	docker compose --profile $(PROFILE) down
+	docker compose --profile $(PROFILE) down --remove-orphans
 
 ps: ## Lista servizi
 	docker compose --profile $(PROFILE) ps
@@ -28,10 +28,6 @@ ps: ## Lista servizi
 restart: ## Restart stack
 	$(MAKE) down PROFILE=$(PROFILE)
 	$(MAKE) up PROFILE=$(PROFILE)
-
-rebuild:
-	docker compose --profile dev down --remove-orphans
-	docker compose --profile dev up -d --build
 
 clean: ## Stop + rimuove volumi (DB/MinIO/app_data) ATTENZIONE: distruttivo
 	docker compose --profile $(PROFILE) down -v --remove-orphans
