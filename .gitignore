@@ -1,4 +1,5 @@
 .env
+.myenv
 logs/
 tmp/
 .venv
