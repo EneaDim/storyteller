@@ -1,22 +1,21 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
-WORKDIR /srv
+WORKDIR /app
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# ffmpeg serve se in futuro vuoi convertire audio (qui è utile anche per compatibilità generale)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates ffmpeg sox zstd \
- && rm -rf /var/lib/apt/lists/*
+      ffmpeg \
+      curl \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://ollama.com/install.sh | sh
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY requirements.txt /srv/requirements.txt
-RUN pip install --no-cache-dir -r /srv/requirements.txt
+COPY . /app
 
-COPY app /srv/app
-COPY bot /srv/bot
-COPY scripts /srv/scripts
+EXPOSE 8080
+CMD ["python", "-m", "app"]
 
-RUN mkdir -p /srv/logs /srv/tmp /srv/.ollama
-ENV PYTHONUNBUFFERED=1
-ENV OLLAMA_MODELS=/srv/.ollama
-
-CMD ["/srv/scripts/prod_api.sh"]

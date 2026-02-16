@@ -1,0 +1,190 @@
+name: podcast-telegram
+
+services:
+  api:
+    build: .
+    container_name: podcast_api
+    env_file: [.env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      ollama:
+        condition: service_started
+      ollama_init:
+        condition: service_started
+    ports:
+      - "${API_PORT:-8080}:8080"
+    command: sh -c "python -m app"
+    volumes:
+      - ./:/app
+      - app_data:/data
+    profiles: ["dev", "prod"]
+
+  worker:
+    build: .
+    container_name: podcast_worker
+    env_file: [.env]
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      ollama:
+        condition: service_started
+      ollama_init:
+        condition: service_started
+    command: sh -c "python -m worker"
+    volumes:
+      - ./:/app
+      - app_data:/data
+    profiles: ["dev", "prod"]
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: podcast_ollama
+    environment:
+      # Qui significa: su che indirizzo ascolta il SERVER dentro questo container
+      - OLLAMA_HOST=0.0.0.0:11434
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    profiles: ["dev", "prod"]
+
+  ollama_init:
+    image: ollama/ollama:latest
+    container_name: podcast_ollama_init
+    depends_on:
+      - ollama
+    env_file: [.env]
+    environment:
+      # Qui significa: a che indirizzo deve puntare il CLIENT ollama (server nel container "ollama")
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ./ollama_init.sh:/scripts/ollama_init.sh:ro
+    entrypoint: ["sh", "/scripts/ollama_init.sh"]
+    profiles: ["dev", "prod"]
+  
+  
+  postgres:
+    image: postgres:16-alpine
+    container_name: podcast_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-podcast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-podcast}
+      POSTGRES_DB: ${POSTGRES_DB:-podcast}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-podcast} -d ${POSTGRES_DB:-podcast}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    profiles: ["dev", "prod"]
+
+  redis:
+    image: redis:7-alpine
+    container_name: podcast_redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    profiles: ["dev", "prod"]
+
+  minio:
+    image: minio/minio:latest
+    container_name: podcast_minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio123456}
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    profiles: ["dev", "prod"]
+
+  minio_init:
+    image: minio/mc:latest
+    container_name: podcast_minio_init
+    depends_on:
+      - minio
+    env_file: [.env]
+    entrypoint:
+      - sh
+      - -lc
+      - |
+        set -e
+
+        echo "[minio_init] Waiting for MinIO on http://minio:9000 ..."
+        # Retry alias set fino a 120s
+        for n in $(seq 1 120); do
+          if mc alias set local http://minio:9000 "${MINIO_ROOT_USER:-minio}" "${MINIO_ROOT_PASSWORD:-minio123456}" >/dev/null 2>&1; then
+            echo "[minio_init] MinIO is ready."
+            break
+          fi
+          echo "[minio_init] Not ready yet... ($${n}/120)"
+          sleep 1
+          if [ "$${n}" = "120" ]; then
+            echo "[minio_init] ERROR: timeout waiting for MinIO"
+            exit 1
+          fi
+        done
+
+        echo "[minio_init] Creating bucket ${S3_BUCKET:-podcasts}"
+        mc mb -p "local/${S3_BUCKET:-podcasts}" || true
+        mc anonymous set download "local/${S3_BUCKET:-podcasts}" || true
+        echo "[minio_init] Done."
+    profiles: ["dev"]
+
+  piper_init:
+    image: python:3.11-slim
+    container_name: podcast_piper_init
+    env_file: [.env]
+    volumes:
+      - piper_models:/models
+      - ./piper_init.sh:/scripts/piper_init.sh:ro
+    command: >
+      sh -lc "
+      apt-get update &&
+      apt-get install -y --no-install-recommends espeak-ng-data &&
+      rm -rf /var/lib/apt/lists/* &&
+      pip install --no-cache-dir piper-tts pathvalidate &&
+      sh /scripts/piper_init.sh
+      "
+    profiles: ["dev", "prod"]
+
+  piper:
+    image: python:3.11-slim
+    container_name: podcast_piper
+    env_file: [.env]
+    depends_on:
+      - piper_init
+    ports:
+      - "8000:8000"
+    volumes:
+      - piper_models:/models
+      - ./piper_server.py:/app/piper_server.py:ro
+    command: >
+      sh -lc "
+      apt-get update &&
+      apt-get install -y --no-install-recommends ffmpeg espeak-ng-data &&
+      rm -rf /var/lib/apt/lists/* &&
+      pip install --no-cache-dir fastapi uvicorn piper-tts pathvalidate &&
+      python /app/piper_server.py
+      "
+    profiles: ["dev", "prod"]
+  
+volumes:
+  pg_data:
+  minio_data:
+  app_data:
+  ollama_data:
+  piper_models:  
