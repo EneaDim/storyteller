@@ -70,6 +70,55 @@ Everything runs locally if desired. No paid APIs required.
 
 ---
 
+# ⚡ Quickstart (Gradio Only)
+
+This quickstart runs the **Gradio demo locally** with **local LLM + local STT + local TTS**.
+
+## 1) Prerequisites
+
+* Docker + Docker Compose
+* (Optional) Make
+
+## 2) Create your `.env`
+
+This repo already ships an **`.env.example`**.
+
+```bash
+cp .env.example .env
+```
+
+## 3) Start the stack (dev profile)
+
+Recommended via Make (build + up in one command):
+
+```bash
+make up
+```
+
+## 4) Open Gradio
+
+* Gradio UI:
+
+```
+http://localhost:8080/demo
+```
+
+## 5) Smoke-test (optional)
+
+```bash
+make check PROFILE=dev
+make check-piper-tts-female
+make check-ollama-tags
+```
+
+## 6) Stop
+
+```bash
+make down
+```
+
+---
+
 # ⚙️ Configuration (.env)
 
 ## LLM
