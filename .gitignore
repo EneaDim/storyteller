@@ -2,4 +2,5 @@
 logs/
 tmp/
 .venv
+*.swp
 __py*

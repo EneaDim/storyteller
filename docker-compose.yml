@@ -67,7 +67,7 @@ services:
       # Qui significa: a che indirizzo deve puntare il CLIENT ollama (server nel container "ollama")
       - OLLAMA_HOST=http://ollama:11434
     volumes:
-      - ./ollama_init.sh:/scripts/ollama_init.sh:ro
+      - ./scripts/ollama_init.sh:/scripts/ollama_init.sh:ro
     entrypoint: ["sh", "/scripts/ollama_init.sh"]
     profiles: ["dev", "prod"]
   
@@ -150,7 +150,7 @@ services:
     env_file: [.env]
     volumes:
       - piper_models:/models
-      - ./piper_init.sh:/scripts/piper_init.sh:ro
+      - ./scripts/piper_init.sh:/scripts/piper_init.sh:ro      
     command: >
       sh -lc "
       apt-get update &&
@@ -171,7 +171,7 @@ services:
       - "8000:8000"
     volumes:
       - piper_models:/models
-      - ./piper_server.py:/app/piper_server.py:ro
+      - ./scripts/piper_server.py:/app/piper_server.py:ro        
     command: >
       sh -lc "
       apt-get update &&
