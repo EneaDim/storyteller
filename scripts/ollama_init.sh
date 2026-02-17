@@ -1,12 +1,10 @@
 #!/bin/sh
 # ollama_init.sh
-# Scopo:
-# - Usa il client 'ollama' per parlare al server Ollama in un altro container
-# - Aspetta che il server risponda
-# - Fa pull automatico del modello scelto
+# - aspetta che il server Ollama risponda
+# - fa pull del modello scelto
 
 set -e
-set -x  # DEBUG: stampa ogni comando eseguito
+set -x
 
 MODEL="${OLLAMA_MODEL:-qwen2.5:3b-instruct}"
 HOST="${OLLAMA_HOST:-http://ollama:11434}"
@@ -14,17 +12,23 @@ HOST="${OLLAMA_HOST:-http://ollama:11434}"
 echo "[ollama_init] Using OLLAMA_HOST=${HOST}"
 echo "[ollama_init] Target model: ${MODEL}"
 
+# IMPORTANTISSIMO: forziamo il client a usare HOST
+export OLLAMA_HOST="${HOST}"
+
 echo "[ollama_init] Waiting for Ollama server to respond to 'ollama list'..."
+
 n=1
 while [ "$n" -le 120 ]; do
-  if ollama list >/dev/null 2>&1; then
+  # Facciamo vedere l'errore ogni tanto (debug utile)
+  if ollama list >/tmp/ollama_list.out 2>/tmp/ollama_list.err; then
     echo "[ollama_init] Ollama is ready."
     break
   fi
 
-  # ogni tanto stampiamo un hint per debug
   if [ "$n" = "1" ] || [ "$n" = "10" ] || [ "$n" = "30" ] || [ "$n" = "60" ] || [ "$n" = "120" ]; then
     echo "[ollama_init] Still not ready... (${n}/120)"
+    echo "[ollama_init] last error:"
+    tail -n 5 /tmp/ollama_list.err || true
   fi
 
   n=$((n + 1))
@@ -32,8 +36,7 @@ while [ "$n" -le 120 ]; do
 done
 
 if [ "$n" -gt 120 ]; then
-  echo "[ollama_init] ERROR: Timeout waiting for Ollama. Check server logs:"
-  echo "             docker logs -f podcast_ollama"
+  echo "[ollama_init] ERROR: Timeout waiting for Ollama at ${HOST}"
   exit 1
 fi
 

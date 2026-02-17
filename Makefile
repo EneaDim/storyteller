@@ -76,6 +76,9 @@ logs-worker: ## Follow logs solo worker
 logs-ollama: ## Follow logs solo Ollama
 	docker compose --profile $(PROFILE) logs -f --tail=200 ollama
 
+logs-ollama-init: ## Follow logs solo Ollama
+	docker compose --profile $(PROFILE) logs -f --tail=200 ollama_init
+
 logs-piper: ## Follow logs solo Piper
 	docker compose --profile $(PROFILE) logs -f --tail=200 piper piper_init
 

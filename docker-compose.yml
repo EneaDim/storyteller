@@ -12,10 +12,6 @@ services:
         condition: service_started
       minio:
         condition: service_started
-      ollama:
-        condition: service_started
-      ollama_init:
-        condition: service_started
     ports:
       - "${API_PORT:-8080}:8080"
     command: sh -c "python -m app"
@@ -35,10 +31,6 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
-      ollama:
-        condition: service_started
-      ollama_init:
-        condition: service_started
     command: sh -c "python -m worker"
     volumes:
       - ./:/app
@@ -52,7 +44,7 @@ services:
       # Qui significa: su che indirizzo ascolta il SERVER dentro questo container
       - OLLAMA_HOST=0.0.0.0:11434
     ports:
-      - "11434:11434"
+      - "11435:11434"
     volumes:
       - ollama_data:/root/.ollama
     profiles: ["dev", "prod"]
@@ -144,44 +136,62 @@ services:
         echo "[minio_init] Done."
     profiles: ["dev"]
 
-  piper_init:
-    image: python:3.11-slim
-    container_name: podcast_piper_init
-    env_file: [.env]
-    volumes:
-      - piper_models:/models
-      - ./scripts/piper_init.sh:/scripts/piper_init.sh:ro      
-    command: >
-      sh -lc "
-      apt-get update &&
-      apt-get install -y --no-install-recommends espeak-ng-data &&
-      rm -rf /var/lib/apt/lists/* &&
-      pip install --no-cache-dir piper-tts pathvalidate &&
-      sh /scripts/piper_init.sh
-      "
-    profiles: ["dev", "prod"]
-
   piper:
     image: python:3.11-slim
     container_name: podcast_piper
     env_file: [.env]
     depends_on:
-      - piper_init
+      piper_init:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
+    environment:
+      - PIPER_MODELS_DIR=/models
     volumes:
       - piper_models:/models
-      - ./scripts/piper_server.py:/app/piper_server.py:ro        
+      - ./scripts/piper_server.py:/app/piper_server.py:ro
     command: >
       sh -lc "
       apt-get update &&
-      apt-get install -y --no-install-recommends ffmpeg espeak-ng-data &&
+      apt-get install -y --no-install-recommends ffmpeg espeak-ng-data curl espeak-ng-data wget ca-certificates &&
       rm -rf /var/lib/apt/lists/* &&
       pip install --no-cache-dir fastapi uvicorn piper-tts pathvalidate &&
       python /app/piper_server.py
       "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
     profiles: ["dev", "prod"]
   
+  piper_init:
+    image: python:3.11-slim
+    container_name: podcast_piper_init
+    env_file: [.env]
+    environment:
+      - PIPER_MODELS_DIR=/models
+    volumes:
+      - piper_models:/models
+      - ./scripts/piper_init.sh:/scripts/piper_init.sh:ro
+    command: >
+      sh -lc "
+      apt-get update &&
+      apt-get install -y --no-install-recommends espeak-ng-data wget ca-certificates &&
+      rm -rf /var/lib/apt/lists/* &&
+      pip install --no-cache-dir piper-tts pathvalidate &&
+      sh /scripts/piper_init.sh
+      "
+    profiles: ["dev", "prod"]
+  
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: podcast_cloudflared
+    depends_on:
+      - api
+    command: tunnel --url http://api:8080 --protocol http2
+    profiles: ["tunnel"]
+    
 volumes:
   pg_data:
   minio_data:

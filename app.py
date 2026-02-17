@@ -31,6 +31,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Literal, Tuple
 
+import asyncio
 import requests
 import stripe
 import boto3
@@ -59,7 +60,7 @@ log = logging.getLogger("podcast_api")
 ProviderLLM = Literal["openai", "google", "ollama", "huggingface"]
 ProviderSTT = Literal["openai_whisper", "google", "local_stub"]
 ProviderTTS = Literal["openai", "google", "elevenlabs", "coqui_stub", "qwen3_tts_http"]
-
+PodcastLang = Literal["it", "en"]
 
 @dataclass
 class Settings:
@@ -115,6 +116,10 @@ class Settings:
     # Telegram
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_webhook_secret: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "change-me")
+    telegram_mode: str = os.getenv("TELEGRAM_MODE", "webhook").strip().lower()  # "polling" | "webhook"
+    telegram_poll_timeout: int = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "30"))
+    telegram_poll_sleep: float = float(os.getenv("TELEGRAM_POLL_SLEEP", "1"))
+    telegram_offset_key: str = os.getenv("TELEGRAM_OFFSET_KEY", "tg_offset").strip() or "tg_offset"
 
     # Stripe
     stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
@@ -122,6 +127,15 @@ class Settings:
     stripe_success_url: str = os.getenv("STRIPE_SUCCESS_URL", "http://localhost:8080/stripe/success")
     stripe_cancel_url: str = os.getenv("STRIPE_CANCEL_URL", "http://localhost:8080/stripe/cancel")
 
+    # Lingua di default del podcast (override per-chat in Redis, override per-job nel payload)
+    podcast_default_lang: str = os.getenv("PODCAST_DEFAULT_LANG", "it").strip().lower()  # "it" | "en"
+
+    # STT: se vuoi forzare lingua diversa dal podcast, setta STT_LANGUAGE.
+    # Se STT_LANGUAGE="auto" => faster-whisper farà autodetect.
+    stt_language_default: str = os.getenv("STT_LANGUAGE", "").strip().lower()  # "", "it", "en", "auto"
+
+    # (Opzionale) prompt style / durata
+    podcast_duration_hint: str = os.getenv("PODCAST_DURATION_HINT", "1–2 minutes").strip()
 
 S = Settings()
 
@@ -153,6 +167,20 @@ def now_ms() -> int:
     """Timestamp utile per debug/health."""
     return int(time.time() * 1000)
 
+def tg_api_get(method: str, params: Optional[dict] = None) -> Dict[str, Any]:
+    """
+    GET wrapper per Telegram Bot API (utile per getUpdates).
+    """
+    if not S.telegram_bot_token:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    url = f"https://api.telegram.org/bot{S.telegram_bot_token}/{method}"
+    r = requests.get(url, params=params or {}, timeout=90)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Telegram API GET error {r.status_code}: {r.text}")
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API returned not ok: {data}")
+    return data
 
 def public_file_url(key: str) -> str:
     """
@@ -241,6 +269,156 @@ def parse_dialogue_script(script: str) -> list[tuple[str, str]]:
 
     return out
 
+# -----------------------------
+# Prosody markup parsing (LLM tags)
+# -----------------------------
+import re
+from dataclasses import dataclass
+from typing import List, Literal, Union
+
+ProsodySpeed = Literal["slow", "normal", "fast"]
+ProsodySfx = Literal["breath", "sigh", "laugh"]
+
+@dataclass
+class Say:
+    text: str
+    speed: ProsodySpeed
+
+@dataclass
+class Pause:
+    ms: int
+
+@dataclass
+class Sfx:
+    kind: ProsodySfx
+
+ProsodyAction = Union[Say, Pause, Sfx]
+
+_TAG_RE = re.compile(r"\[(PAUSE=\d+|BREATH|SIGH|LAUGH|SLOW|NORMAL|FAST)\]")
+
+def parse_prosody_actions(utterance: str, default_speed: ProsodySpeed = "normal") -> List[ProsodyAction]:
+    """
+    Parse a single utterance containing tags into actions.
+    Supported tags:
+      [PAUSE=ms] (0..2000 clamped)
+      [BREATH] [SIGH] [LAUGH]
+      [SLOW] [NORMAL] [FAST]  (stateful)
+    """
+    s = (utterance or "").strip()
+    if not s:
+        return []
+
+    actions: List[ProsodyAction] = []
+    speed: ProsodySpeed = default_speed
+
+    parts = _TAG_RE.split(s)  # [text, tag, text, tag, ...]
+    for part in parts:
+        if not part:
+            continue
+        part = part.strip()
+        if not part:
+            continue
+
+        # Tag handling
+        if part.startswith("PAUSE="):
+            try:
+                ms = int(part.split("=", 1)[1])
+                ms = max(0, min(ms, 2000))
+                actions.append(Pause(ms=ms))
+            except Exception:
+                pass
+            continue
+
+        if part in ("BREATH", "SIGH", "LAUGH"):
+            actions.append(Sfx(kind=part.lower()))  # type: ignore[arg-type]
+            continue
+
+        if part in ("SLOW", "NORMAL", "FAST"):
+            speed = {"SLOW": "slow", "NORMAL": "normal", "FAST": "fast"}[part]  # type: ignore[assignment]
+            continue
+
+        # Text chunk
+        actions.append(Say(text=part, speed=speed))
+
+    # Merge adjacent Say with same speed
+    merged: List[ProsodyAction] = []
+    for a in actions:
+        if merged and isinstance(a, Say) and isinstance(merged[-1], Say) and a.speed == merged[-1].speed:
+            merged[-1].text = (merged[-1].text.rstrip() + " " + a.text.lstrip()).strip()
+        else:
+            merged.append(a)
+
+    return merged
+
+def _speed_to_length_scale(speed: str) -> float:
+    # Piper: smaller length_scale => faster speech; larger => slower
+    return {"slow": 1.15, "normal": 1.0, "fast": 0.88}.get(speed, 1.0)
+
+def tts_synthesize_with_speed(text: str, voice: str, lang: str, speed: str) -> bytes:
+    """
+    Same as tts_synthesize(), but passes length_scale when using piper_http.
+    Falls back to normal tts_synthesize for other providers.
+    """
+    import os
+
+    text = (text or "").strip()
+    if not text:
+        return b""
+
+    lang = normalize_lang(lang)
+    provider = (getattr(S, "tts_provider", "") or os.getenv("TTS_PROVIDER", "coqui_stub")).strip().lower()
+
+    if provider != "piper_http":
+        return tts_synthesize(text, voice=voice, lang=lang)
+
+    base = (os.getenv("PIPER_TTS_URL", "") or "").strip()
+    fmt = (os.getenv("PIPER_TTS_FORMAT", "mp3") or "mp3").strip().lower()
+    if not base:
+        raise RuntimeError("TTS_PROVIDER=piper_http but PIPER_TTS_URL is empty")
+
+    voice_id = (voice or "").strip() or get_available_voices(lang)[0]
+    length_scale = _speed_to_length_scale(speed)
+
+    payload = {
+        "text": text,
+        "voice_id": voice_id,
+        "format": fmt,
+        "lang": lang,
+        "length_scale": length_scale,   # <-- requires piper_server support (next step if missing)
+    }
+
+    r = requests.post(f"{base.rstrip('/')}/tts", json=payload, timeout=240)
+    if r.status_code != 200:
+        raise RuntimeError(f"Piper TTS error {r.status_code}: {r.text[:1200]}")
+    if not r.content:
+        raise RuntimeError("Piper TTS returned empty audio bytes")
+    return r.content
+
+def make_silence_mp3(ms: int, out_path: str) -> None:
+    """
+    Generate silence MP3 of ms duration.
+    Requires ffmpeg.
+    """
+    import subprocess
+
+    ms = int(ms)
+    ms = max(0, min(ms, 5000))
+    dur = ms / 1000.0
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"anullsrc=r=48000:cl=mono",
+        "-t", f"{dur:.3f}",
+        "-q:a", "4",
+        "-codec:a", "libmp3lame",
+        out_path,
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", errors="ignore")
+        raise RuntimeError(f"ffmpeg silence failed: {err[:1600]}")
+
 def concat_mp3_files(mp3_paths: list[str], out_path: str) -> None:
     """
     Concatena più clip MP3 in un MP3 unico *ricodificando* (NO -c copy).
@@ -292,9 +470,212 @@ def concat_mp3_files(mp3_paths: list[str], out_path: str) -> None:
         except Exception:
             pass
 
+def normalize_lang(lang: str) -> str:
+    """
+    Normalizza codici lingua in "it" o "en".
+    Accetta varianti comuni: "ita", "italian", "en_US", ecc.
+    """
+    x = (lang or "").strip().lower()
+    if not x:
+        return S.podcast_default_lang
+    if x.startswith("it"):
+        return "it"
+    if x.startswith("en"):
+        return "en"
+    if x in ("italian", "ita"):
+        return "it"
+    if x in ("english", "eng"):
+        return "en"
+    return S.podcast_default_lang
+
+
+def get_chat_lang(chat_id: str) -> str:
+    """
+    Lingua per-chat salvata su Redis: lang:<chat_id> = "it" | "en"
+    Fallback: PODCAST_DEFAULT_LANG
+    """
+    if not chat_id:
+        return S.podcast_default_lang
+    key = f"lang:{chat_id}"
+    try:
+        val = redis_conn.get(key)
+        v = (val or b"").decode("utf-8").strip().lower()
+        if v in ("it", "en"):
+            return v
+    except Exception:
+        pass
+    return S.podcast_default_lang
+
+
+def set_chat_lang(chat_id: str, lang: str) -> str:
+    """
+    Set lingua per-chat in Redis. Ritorna la lingua normalizzata.
+    """
+    lang2 = normalize_lang(lang)
+    if chat_id:
+        try:
+            redis_conn.set(f"lang:{chat_id}", lang2)
+        except Exception:
+            pass
+    return lang2
+
+def _voice_pref_key(chat_id: str, lang: str, role: str) -> str:
+    return f"tg:voice:{chat_id}:{lang}:{role}"  # role narrator|expert
+
+def get_chat_voice_id(chat_id: str, lang: str, role: str, fallback: str) -> str:
+    try:
+        v = redis_conn.get(_voice_pref_key(chat_id, lang, role))
+        s = (v or b"").decode("utf-8").strip()
+        return s or fallback
+    except Exception:
+        return fallback
+
+def set_chat_voice_id(chat_id: str, lang: str, role: str, voice_id: str) -> None:
+    voice_id = (voice_id or "").strip()
+    if voice_id:
+        redis_conn.set(_voice_pref_key(chat_id, lang, role), voice_id)
+
+# -----------------------------
+# i18n (Telegram texts)
+# -----------------------------
+I18N = {
+    "it": {
+        "start": "Ciao! 🎧\nMandami un testo o un vocale e creo un mini-podcast.",
+        "ask_input": "Ok! Mandami ora testo oppure un vocale 🎙️",
+        "received": "⏳ Ricevuto! Sto generando il podcast…",
+        "received_voice": "🎙️ Vocale ricevuto! Sto trascrivendo e generando…",
+        "help": "💡 Invia un testo o un vocale.\nIo genero uno script e (se TTS attivo) anche l’audio.",
+        "locked": "🔒 Per generare devi essere abbonato.",
+        "lang_set": "✅ Lingua impostata: {label}\n\nMandami un testo o un vocale 🎙️",
+        "unknown": "Azione non riconosciuta.",
+        "bad_format": "Formato non riconosciuto. Invia testo o vocale.",
+        "voices_title": "🎙️ Voci\nScegli cosa vuoi configurare:",
+        "voices_role": "Scegli la voce per: {role_label}",
+        "saved_voice": "✅ Voce salvata per {role_label}: {voice_id}",
+        "preview_sent": "🎧 Anteprima voce: {voice_id}",
+    },
+    "en": {
+        "start": "Hi! 🎧\nSend me text or a voice message and I’ll generate a mini-podcast.",
+        "ask_input": "Great — now send text or a voice message 🎙️",
+        "received": "⏳ Got it! Generating the podcast…",
+        "received_voice": "🎙️ Voice received! Transcribing and generating…",
+        "help": "💡 Send text or a voice message.\nI’ll generate a script and (if TTS is enabled) also the audio.",
+        "locked": "🔒 You must be subscribed to generate podcasts.",
+        "lang_set": "✅ Language set: {label}\n\nNow send text or a voice message 🎙️",
+        "unknown": "Unknown action.",
+        "bad_format": "Unsupported format. Send text or a voice message.",
+        "voices_title": "🎙️ Voices\nWhat do you want to configure?",
+        "voices_role": "Choose the voice for: {role_label}",
+        "saved_voice": "✅ Saved voice for {role_label}: {voice_id}",
+        "preview_sent": "🎧 Voice preview: {voice_id}",
+    },
+}
+
+def t(chat_id: str, key: str, **kwargs) -> str:
+    lang = get_chat_lang(chat_id)
+    s = (I18N.get(lang, I18N["it"]).get(key) or I18N["it"][key])
+    return s.format(**kwargs)
+
 # -----------------------------
 # Telegram API helpers
 # -----------------------------
+def build_pay_url(chat_id: str) -> str:
+    """
+    Ritorna URL assoluto per /pay se e solo se PUBLIC_BASE_URL è configurato e valido.
+    In polling locale tipicamente torna "" e quindi NON mostriamo il bottone.
+    """
+    base = (S.public_base_url or "").strip()
+    if base.startswith("http://") or base.startswith("https://"):
+        return f"{base.rstrip('/')}/pay/tg/{chat_id}"
+    return ""
+
+def build_lang_keyboard(chat_id: str = "") -> list:
+    return [[
+        {"text": "🇮🇹 Italiano", "callback_data": "lang_it"},
+        {"text": "🇬🇧 English", "callback_data": "lang_en"},
+    ]]
+
+def get_available_voices(lang: str) -> list[str]:
+    """
+    Voices shown in Telegram.
+    Configure via env:
+      PIPER_VOICES_IT="it_IT-paola-medium,it_IT-riccardo-x_low"
+      PIPER_VOICES_EN="en_US-amy-medium,en_GB-alan-medium"
+    """
+    lang = normalize_lang(lang)
+    raw = os.getenv("PIPER_VOICES_EN" if lang == "en" else "PIPER_VOICES_IT", "").strip()
+    voices = [v.strip() for v in raw.split(",") if v.strip()]
+
+    # fallback to something safe if env is empty
+    if not voices:
+        voices = ["en_US-amy-medium", "en_GB-alan-medium"] if lang == "en" else ["it_IT-paola-medium", "it_IT-riccardo-x_low"]
+    return voices
+
+
+def build_voice_menu_keyboard(chat_id: str) -> list:
+    lang = get_chat_lang(chat_id)
+    back = "⬅️ Back" if lang == "en" else "⬅️ Indietro"
+    narrator = "🎙️ Narrator" if lang == "en" else "🎙️ Narratore"
+    expert = "🧠 Expert" if lang == "en" else "🧠 Esperto"
+
+    return [
+        [{"text": narrator, "callback_data": "voices_role:narrator"}],
+        [{"text": expert, "callback_data": "voices_role:expert"}],
+        [{"text": back, "callback_data": "home"}],
+    ]
+
+def role_label(chat_id: str, role: str) -> str:
+    lang = get_chat_lang(chat_id)
+    if role == "expert":
+        return "Expert" if lang == "en" else "Esperto"
+    return "Narrator" if lang == "en" else "Narratore"
+
+
+def build_voice_list_keyboard(chat_id: str, role: str) -> list:
+    """
+    Shows per-voice:
+      - set voice (saves in Redis)
+      - preview voice (enqueue preview job)
+    """
+    lang = get_chat_lang(chat_id)
+    voices = get_available_voices(lang)
+    preview = "▶️ Preview" if lang == "en" else "▶️ Anteprima"
+    back = "⬅️ Back" if lang == "en" else "⬅️ Indietro"
+
+    rows = []
+    for v in voices:
+        rows.append([
+            {"text": f"✅ {v}", "callback_data": f"voice_set:{role}:{v}"},
+            {"text": preview, "callback_data": f"voice_preview:{v}"},
+        ])
+
+    rows.append([{"text": back, "callback_data": "voices"}])
+    return rows
+
+def build_preview_text(chat_id: str) -> str:
+    lang = get_chat_lang(chat_id)
+    if lang == "en":
+        return os.getenv("PREVIEW_TEXT_EN", "Hi! This is a voice preview for the podcast.").strip()
+    return os.getenv("PREVIEW_TEXT_IT", "Ciao! Questa è una demo di voce per il podcast.").strip()
+
+def build_home_keyboard(chat_id: str) -> list:
+    lang = get_chat_lang(chat_id)
+    btn_new = "➕ New podcast" if lang == "en" else "➕ Nuovo podcast"
+    btn_voices = "🎙️ Voices" if lang == "en" else "🎙️ Voci"
+    btn_sub = "💳 Subscribe" if lang == "en" else "💳 Abbonati"
+    btn_help = "❓ Help" if lang == "en" else "❓ Aiuto"
+
+    buttons: list = [
+        [{"text": btn_new, "callback_data": "new"}],
+        [{"text": btn_voices, "callback_data": "voices"}],
+        *build_lang_keyboard(chat_id),  # ✅ now valid
+        [{"text": btn_help, "callback_data": "help"}],
+    ]
+    pay_url = build_pay_url(chat_id)
+    if pay_url:
+        buttons.insert(2, [{"text": btn_sub, "url": pay_url}])
+    return buttons
+
 def tg_api(method: str, payload: Optional[dict] = None, files: Optional[dict] = None) -> Dict[str, Any]:
     """
     Wrapper minimale per Telegram Bot API.
@@ -361,63 +742,93 @@ def tg_get_file_bytes(file_id: str) -> Tuple[bytes, str]:
     r.raise_for_status()
     return r.content, file_path
 
-
 # -----------------------------
 # Providers: LLM / STT / TTS
 # -----------------------------
-def llm_generate_script(input_text: str) -> str:
+def llm_generate_script(input_text: str, lang: str = "") -> str:
     """
-    Genera uno script podcast in italiano usando il provider scelto.
+    Genera uno script podcast in IT o EN usando il provider scelto.
+    Formato SEMPRE:
+      NARRATOR: ...
+      EXPERT: ...
 
-    Fix importante:
-    - Per Ollama usiamo /api/chat (supporto stabile per modelli instruct).
-      Alcune build/container non espongono /api/generate e rispondono 404.
-
-    Implementati:
-    - ollama (HTTP /api/chat)
-    - openai (REST /v1/responses)
-    - google (google-genai SDK)
-    - huggingface (endpoint HTTP)
+    lang: "it" | "en" (fallback: PODCAST_DEFAULT_LANG)
     """
-    prompt = (
-        "Sei un autore di podcast.\n"
-        "Scrivi uno script moderno e coinvolgente in italiano.\n"
-        "Vincoli:\n"
-        "Formato OBBLIGATORIO:"
-        '- Ogni riga deve iniziare con "NARRATOR:" oppure "EXPERT:"'
-        "- Nessuna riga senza prefisso"
-        "- Frasi brevi e naturali, stile podcast"
-        "- Non usare markdown, non usare titoli"
-        "- durata parlata 1-2 minuti\n"
-        "- apertura con hook, 3 sezioni, chiusura con call-to-action\n"
-        "- output solo testo, niente markdown\n\n"
-        f"INPUT:\n{input_text.strip()}\n"
-    )
+    lang = normalize_lang(lang)
+
+    if lang == "en":
+        system_msg = "You are a podcast scriptwriter. Output plain text only."
+        prompt = (
+            "Write a modern, engaging podcast dialogue in ENGLISH.\n"
+            "MANDATORY constraints (if you violate them, the answer is wrong):\n"
+            "1) Each line MUST be a separate utterance.\n"
+            '2) Each line MUST start EXACTLY with "NARRATOR:" or "EXPERT:"\n'
+            "3) BOTH voices must appear (at least 4 lines NARRATOR and 4 lines EXPERT).\n"
+            "4) No markdown, no titles, dialogue only.\n"
+            f"5) Spoken duration: {S.podcast_duration_hint}.\n"
+            "6) Structure: opening hook, 3 sections, closing with a call-to-action.\n"
+            "\n"
+            "PROSODY TAGS (optional but encouraged, use intentionally, NOT randomly):\n"
+            "- Tags are allowed ONLY inside a dialogue line, never as standalone lines.\n"
+            "- Allowed tags only: [PAUSE=150..800], [BREATH], [SIGH], [LAUGH], [SLOW], [NORMAL], [FAST]\n"
+            "- Speed tags are stateful until changed.\n"
+            "- Per line limits: max 2 pauses, max 2 SFX tags, do not put tags back-to-back.\n"
+            "- Use tags to improve natural delivery (e.g., short pause after a hook, breath before a long explanation).\n"
+            "\n"
+            "FORMAT EXAMPLE (example only, don't copy content):\n"
+            "NARRATOR: ... [PAUSE=250] ...\n"
+            "EXPERT: ... [BREATH] ...\n"
+            "\n"
+            f"INPUT:\n{(input_text or '').strip()}\n"
+        )
+        
+    else:
+        system_msg = "Rispondi sempre in italiano. Output solo testo."
+        prompt = (
+            "Sei un autore di podcast.\n"
+            "Scrivi uno script moderno e coinvolgente in ITALIANO.\n"
+            "Vincoli OBBLIGATORI (se non li rispetti, la risposta è considerata errata):\n"
+            "1) Ogni battuta DEVE essere su una riga separata.\n"
+            '2) Ogni riga DEVE iniziare ESATTAMENTE con "NARRATOR:" oppure "EXPERT:"\n'
+            "3) Devono comparire ENTRAMBE le voci (almeno 4 righe NARRATOR e 4 righe EXPERT).\n"
+            "4) Niente markdown, niente titoli, solo dialogo.\n"
+            f"5) Durata parlata {S.podcast_duration_hint}.\n"
+            "6) Struttura: hook iniziale, 3 sezioni, chiusura con call-to-action.\n"
+            "\n"
+            "TAG DI PROSODIA (opzionali ma consigliati, usali con intenzione, NON a caso):\n"
+            "- I tag sono consentiti SOLO dentro la stessa riga di dialogo, mai su righe isolate.\n"
+            "- Tag consentiti: [PAUSE=150..800], [BREATH], [SIGH], [LAUGH], [SLOW], [NORMAL], [FAST]\n"
+            "- I tag di velocità restano attivi finché non cambi tag.\n"
+            "- Limiti per riga: max 2 pause, max 2 SFX, niente tag consecutivi.\n"
+            "- Usa i tag per migliorare la naturalezza (es. pausa breve dopo un hook, respiro prima di una spiegazione lunga).\n"
+            "\n"
+            "ESEMPIO DI FORMATO (solo esempio, non copiare il contenuto):\n"
+            "NARRATOR: ... [PAUSE=250] ...\n"
+            "EXPERT: ... [BREATH] ...\n"
+            "\n"
+            f"INPUT:\n{(input_text or '').strip()}\n"
+        )
+       
 
     # -------------------------
     # OLLAMA (via /api/chat)
     # -------------------------
     if S.llm_provider == "ollama":
-        # Endpoint chat (moderno e consigliato)
         url = f"{S.ollama_base_url.rstrip('/')}/api/chat"
         payload = {
             "model": S.ollama_model,
             "stream": False,
             "messages": [
-                {"role": "system", "content": "Rispondi sempre in italiano. Output solo testo."},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt},
             ],
+            "options": {"temperature": 0.2},
         }
 
         r = requests.post(url, json=payload, timeout=180)
-
-        # Se per qualche motivo /api/chat non esistesse, qui vedresti 404:
-        # puoi eventualmente fare fallback, ma per ora preferiamo errori espliciti.
         r.raise_for_status()
         data = r.json()
 
-        # Formato tipico:
-        # { "message": { "role": "assistant", "content": "..." }, ... }
         msg = (data.get("message") or {}).get("content") or ""
         return str(msg).strip()
 
@@ -448,19 +859,27 @@ def llm_generate_script(input_text: str) -> str:
     # -------------------------
     if S.llm_provider == "google":
         from google import genai
-
-        api_key = S.google_api_key or os.getenv("GEMINI_API_KEY", "")
+        from google.genai import types
+    
+        api_key = (S.google_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
         if not api_key:
             raise RuntimeError("Missing GOOGLE_API_KEY (or GEMINI_API_KEY) for Google GenAI")
-
+    
         client = genai.Client(api_key=api_key)
-        resp = client.models.generate_content(model=S.google_model, contents=prompt)
-
-        text = getattr(resp, "text", None)
-        if text:
-            return str(text).strip()
+    
+        resp = client.models.generate_content(
+            model=S.google_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_msg,
+                temperature=0.2,
+            ),
+        )
+    
+        if getattr(resp, "text", None):
+            return str(resp.text).strip()
         return str(resp).strip()
-
+    
     # -------------------------
     # HUGGINGFACE ENDPOINT
     # -------------------------
@@ -480,35 +899,40 @@ def llm_generate_script(input_text: str) -> str:
 
     raise RuntimeError(f"Unknown LLM_PROVIDER={S.llm_provider}")
 
-def stt_transcribe(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
+def stt_transcribe(audio_bytes: bytes, mime: str = "audio/ogg", lang: str = "") -> str:
     """
     Speech-to-Text (STT).
-    - Modalità free+locale: faster-whisper (CPU) -> STT_PROVIDER=faster_whisper_local
-    - Altri provider (es. openai_whisper) puoi lasciarli per prod, ma in dev usiamo locale.
-
-    Note importanti:
-    - Telegram voice è spesso OGG/OPUS: lo convertiamo a WAV 16kHz mono con ffmpeg prima di trascrivere.
-    - Carichiamo il modello una sola volta (cache globale) per non ricaricarlo a ogni richiesta.
+    - faster-whisper locale: STT_PROVIDER=faster_whisper_local
+    - lang: "it" | "en" (fallback: PODCAST_DEFAULT_LANG)
+    - Se STT_LANGUAGE env è settato, prevale su lang (eccetto "", usa lang).
+      Se STT_LANGUAGE="auto" => autodetect (language=None).
     """
     import os
     import tempfile
     import subprocess
 
+    lang = normalize_lang(lang)
+
     provider = (getattr(S, "stt_provider", "") or os.getenv("STT_PROVIDER", "stub")).strip().lower()
 
-    # --- Stub (vecchio comportamento) ---
     if provider in ("stub", "none", ""):
         return "Trascrizione (stub): abilita STT_PROVIDER=faster_whisper_local per trascrivere davvero."
 
-    # --- Free + locale: faster-whisper ---
     if provider == "faster_whisper_local":
-        # Import qui per non pesare se STT disattivato
         from faster_whisper import WhisperModel
 
         model_name = (os.getenv("STT_MODEL", "base") or "base").strip()
-        language = (os.getenv("STT_LANGUAGE", "it") or "it").strip()
 
-        # Cache globale del modello (caricamento una sola volta)
+        # Priorità lingua:
+        # 1) S.stt_language_default (STT_LANGUAGE) se valorizzato
+        # 2) lang del podcast (it/en)
+        # 3) se "auto" => language=None
+        stt_lang = (S.stt_language_default or "").strip().lower()
+        if not stt_lang:
+            stt_lang = lang
+
+        language_arg = None if stt_lang == "auto" else stt_lang
+
         global _FW_MODEL
         try:
             _FW_MODEL  # type: ignore[name-defined]
@@ -516,10 +940,8 @@ def stt_transcribe(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
             _FW_MODEL = None  # type: ignore[name-defined]
 
         if _FW_MODEL is None:  # type: ignore[name-defined]
-            # CPU-friendly (compute_type=int8)
             _FW_MODEL = WhisperModel(model_name, device="cpu", compute_type="int8")  # type: ignore[name-defined]
 
-        # 1) Salva input su file temporaneo
         with tempfile.TemporaryDirectory() as td:
             in_path = os.path.join(td, "in.bin")
             wav_path = os.path.join(td, "audio.wav")
@@ -527,8 +949,6 @@ def stt_transcribe(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
             with open(in_path, "wb") as f:
                 f.write(audio_bytes)
 
-            # 2) Converti a WAV 16kHz mono (robusto per OGG/OPUS)
-            # ffmpeg deve essere presente nel container (tu già lo installi)
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -543,11 +963,10 @@ def stt_transcribe(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
                 err = p.stderr.decode("utf-8", errors="ignore")
                 raise RuntimeError(f"ffmpeg convert failed: {err[:1200]}")
 
-            # 3) Trascrivi
             segments, info = _FW_MODEL.transcribe(  # type: ignore[name-defined]
                 wav_path,
-                language=language,
-                vad_filter=True,   # aiuta su pause/silenzi
+                language=language_arg,
+                vad_filter=True,
             )
 
             text_parts = []
@@ -558,167 +977,197 @@ def stt_transcribe(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
 
             return " ".join(text_parts).strip()
 
-    # --- OpenAI Whisper (a pagamento) ---
     if provider == "openai_whisper":
         raise RuntimeError("openai_whisper richiede OPENAI_API_KEY (a pagamento). In dev usa faster_whisper_local.")
 
     raise RuntimeError(f"Unknown STT_PROVIDER={provider}")
 
-def tts_synthesize(text: str, voice: str = "female") -> bytes:
+def tts_synthesize(text: str, voice: str = "", lang: str = "") -> bytes:
     """
-    Text-to-Speech (TTS) -> ritorna bytes audio (MP3).
-
-    Supporta due voci logiche:
-      - voice="female"  -> narratrice
-      - voice="male"    -> esperto
-
-    Provider supportati (minimale ma completo):
-      - coqui_stub: nessun audio (dev super-light)
-      - piper_http: TTS gratuito locale via servizio Docker (piper_server.py)
-      - openai: (non usato in modalità free) a pagamento
-
-    Env richieste per piper_http:
-      TTS_PROVIDER=piper_http
-      PIPER_TTS_URL=http://piper:8000
-      PIPER_TTS_FORMAT=mp3
+    voice MUST be a real voice_id when using piper_http (e.g. it_IT-paola-medium)
     """
     import os
 
-    # Normalizzazione input
     text = (text or "").strip()
     if not text:
         return b""
 
-    # Normalizzazione voce
-    voice_norm = (voice or "female").strip().lower()
-    if voice_norm not in ("female", "male"):
-        # Fallback sicuro: narratrice
-        voice_norm = "female"
+    lang = normalize_lang(lang)
+    provider = (getattr(S, "tts_provider", "") or os.getenv("TTS_PROVIDER", "coqui_stub")).strip().lower()
 
-    # Provider scelto (dal tuo settings/env)
-    provider = getattr(S, "tts_provider", "") or os.getenv("TTS_PROVIDER", "coqui_stub")
-    provider = provider.strip().lower()
-
-    # ----------------------------
-    # 1) Stub (nessun audio)
-    # ----------------------------
     if provider == "coqui_stub":
         return b""
 
-    # ----------------------------
-    # 2) Piper via HTTP (consigliato: gratis, locale)
-    # ----------------------------
     if provider == "piper_http":
         base = (os.getenv("PIPER_TTS_URL", "") or "").strip()
         fmt = (os.getenv("PIPER_TTS_FORMAT", "mp3") or "mp3").strip().lower()
-
         if not base:
-            raise RuntimeError("TTS_PROVIDER=piper_http ma PIPER_TTS_URL è vuoto")
+            raise RuntimeError("TTS_PROVIDER=piper_http but PIPER_TTS_URL is empty")
+        if fmt not in ("mp3", "wav"):
+            raise RuntimeError("PIPER_TTS_FORMAT must be 'mp3' or 'wav'")
 
-        # Il nostro piper_server accetta voice "male"/"female" e format "mp3"/"wav"
-        payload = {"text": text, "voice": voice_norm, "format": fmt}
+        voice_id = (voice or "").strip()
+        if not voice_id:
+            # safe fallback if caller forgot voice_id
+            voices = get_available_voices(lang)
+            voice_id = voices[0]
 
-        # Timeout lungo: TTS può essere lento su CPU
+        payload = {
+            "text": text,
+            "voice_id": voice_id,   # ✅ correct
+            "format": fmt,
+            "lang": lang,
+        }
+
         r = requests.post(f"{base.rstrip('/')}/tts", json=payload, timeout=240)
-
-        # Se il server risponde con errore, includiamo dettaglio per debug
         if r.status_code != 200:
-            raise RuntimeError(f"Piper TTS error {r.status_code}: {r.text[:600]}")
-
-        # In caso di risposta JSON (errori), fermiamo qui
-        ct = (r.headers.get("content-type") or "").lower()
-        if "application/json" in ct:
-            raise RuntimeError(f"Piper TTS returned JSON: {r.text[:600]}")
-
+            raise RuntimeError(f"Piper TTS error {r.status_code}: {r.text[:1200]}")
+        if not r.content:
+            raise RuntimeError("Piper TTS returned empty audio bytes")
         return r.content
 
-    # ----------------------------
-    # 3) OpenAI (a pagamento) - opzionale
-    # ----------------------------
     if provider == "openai":
-        raise RuntimeError("OpenAI TTS è a pagamento. In modalità free/local usa piper_http.")
+        raise RuntimeError("OpenAI TTS is paid. Use piper_http for local/free mode.")
 
-
-    raise RuntimeError(f"Unknown TTS_PROVIDER={S.tts_provider}")
-
+    raise RuntimeError(f"Unknown TTS_PROVIDER={provider}")
 
 # -----------------------------
 # Job: pipeline podcast
 # -----------------------------
-def run_podcast_pipeline(user_id: str, input_text: str, input_audio_s3_key: str = "") -> Dict[str, Any]:
+def run_podcast_pipeline(
+    user_id: str,
+    input_text: str,
+    input_audio_s3_key: str = "",
+    lang: str = "",
+    chat_id: str = ""
+) -> Dict[str, Any]:
     """
-    Pipeline unica:
-    1) Se c'è audio S3 -> STT -> transcript
-       altrimenti transcript = input_text
-    2) LLM -> script podcast
-    3) TTS -> mp3 (2 voci se dialogato)
-    4) (opzionale) Upload su S3/MinIO
-    5) Ritorna transcript + script + mp3_bytes (per Gradio)
+    Pipeline unica (bilingue):
+    1) Transcript:
+       - se audio S3 => STT(lang)
+       - altrimenti transcript = input_text
+    2) Script:
+       - LLM(lang) => dialogo "NARRATOR:" / "EXPERT:"
+    3) Audio:
+       - parse_dialogue_script => TTS per turni (lang) => concat MP3 ricodificando
+    4) Upload opzionale su S3
     """
     import os
     import uuid
     import tempfile
+
+    lang = normalize_lang(lang)
 
     # 1) Transcript
     transcript = (input_text or "").strip()
 
     if input_audio_s3_key:
         audio_bytes = s3_get_bytes(input_audio_s3_key)
-        transcript = stt_transcribe(audio_bytes, mime="audio/ogg").strip()
+        transcript = stt_transcribe(audio_bytes, mime="audio/ogg", lang=lang).strip()
 
-        # Se STT fallisce, NON vogliamo generare podcast “a caso”
+        # No contenuto random: se STT fallisce/è troppo corto => errore
         if len(transcript) < 8:
             raise RuntimeError("STT vuoto o troppo corto: riprova con un vocale più chiaro o più lungo.")
 
     if not transcript:
         raise RuntimeError("Empty transcript: provide text or audio")
 
-    # 2) Script LLM (basato SOLO sul transcript reale)
-    script = llm_generate_script(transcript)
+    # 2) Script (solo da transcript reale)
+    script = llm_generate_script(transcript, lang=lang)
+    if not script.strip():
+        raise RuntimeError("LLM returned empty script")
 
-    # 3) TTS (2 voci se dialogo)
+    # 3) TTS
     narrator_voice = os.getenv("PODCAST_VOICE_NARRATOR", "female").strip().lower()
     expert_voice = os.getenv("PODCAST_VOICE_EXPERT", "male").strip().lower()
 
     audio_mp3: bytes = b""
-    if S.tts_provider != "coqui_stub":
+
+    fallback_f_it = os.getenv("PIPER_VOICE_F_IT", os.getenv("PIPER_VOICE_F", "it_IT-paola-medium")).strip()
+    fallback_m_it = os.getenv("PIPER_VOICE_M_IT", os.getenv("PIPER_VOICE_M", "it_IT-riccardo-x_low")).strip()
+    fallback_f_en = os.getenv("PIPER_VOICE_F_EN", fallback_f_it).strip()
+    fallback_m_en = os.getenv("PIPER_VOICE_M_EN", fallback_m_it).strip()
+    
+    if lang == "en":
+        fb_narr = fallback_f_en
+        fb_exp = fallback_m_en
+    else:
+        fb_narr = fallback_f_it
+        fb_exp = fallback_m_it
+    
+    # Se ho chat_id, leggo preferenze; altrimenti fallback
+    if chat_id:
+        narrator_voice_id = get_chat_voice_id(chat_id, lang, "narrator", fb_narr)
+        expert_voice_id = get_chat_voice_id(chat_id, lang, "expert", fb_exp)
+    else:
+        narrator_voice_id = fb_narr
+        expert_voice_id = fb_exp
+
+    if (getattr(S, "tts_provider", "") or "").strip().lower() != "coqui_stub":
         turns = parse_dialogue_script(script)
+
+        # decide se dialogo o monologo
         is_dialogue = (len(turns) >= 2) and any(spk == "EXPERT" for spk, _ in turns)
 
         if is_dialogue:
             with tempfile.TemporaryDirectory() as td:
                 clip_paths: list[str] = []
-                for idx, (speaker, text) in enumerate(turns):
-                    voice = narrator_voice if speaker == "NARRATOR" else expert_voice
-                    clip_bytes = tts_synthesize(text, voice=voice)
-                    if not clip_bytes:
-                        raise RuntimeError(f"TTS returned empty audio for turn {idx} speaker={speaker}")
-                    clip_path = os.path.join(td, f"clip_{idx:04d}.mp3")
-                    with open(clip_path, "wb") as f:
-                        f.write(clip_bytes)
-                    clip_paths.append(clip_path)
+                SFX_MS = {"breath": 180, "sigh": 250, "laugh": 220}
+                
+                clip_index = 0
+                for turn_idx, (speaker, turn_text) in enumerate(turns):
+                    voice_id = narrator_voice_id if speaker == "NARRATOR" else expert_voice_id
+                
+                    actions = parse_prosody_actions(turn_text, default_speed="normal")
+                
+                    for a in actions:
+                        if isinstance(a, Say):
+                            clip_bytes = tts_synthesize_with_speed(a.text, voice=voice_id, lang=lang, speed=a.speed)
+                            if not clip_bytes:
+                                raise RuntimeError(f"TTS empty for turn {turn_idx} speaker={speaker}")
+                            clip_path = os.path.join(td, f"clip_{clip_index:06d}.mp3")
+                            with open(clip_path, "wb") as f:
+                                f.write(clip_bytes)
+                            clip_paths.append(clip_path)
+                            clip_index += 1
+                
+                        elif isinstance(a, Pause):
+                            clip_path = os.path.join(td, f"clip_{clip_index:06d}.mp3")
+                            make_silence_mp3(a.ms, clip_path)
+                            clip_paths.append(clip_path)
+                            clip_index += 1
+                
+                        elif isinstance(a, Sfx):
+                            # placeholder: silence for now
+                            ms = SFX_MS.get(a.kind, 200)
+                            clip_path = os.path.join(td, f"clip_{clip_index:06d}.mp3")
+                            make_silence_mp3(ms, clip_path)
+                            clip_paths.append(clip_path)
+                            clip_index += 1
 
-                out_mp3 = os.path.join(td, "podcast.mp3")
-                concat_mp3_files(clip_paths, out_mp3)  # versione re-encode
-                audio_mp3 = open(out_mp3, "rb").read()
         else:
-            audio_mp3 = tts_synthesize(script, voice=narrator_voice)
+            # fallback: TTS dell’intero script (di solito meno naturale ma funziona)
+            audio_mp3 = tts_synthesize(script, voice=narrator_voice, lang=lang)
 
-    # 4) Upload opzionale (per demo puoi spegnerlo)
+    # 4) Upload opzionale
     store = (os.getenv("STORE_OUTPUTS", "0").strip() == "1")
     script_url = ""
     mp3_url = ""
+
     if store:
         out_id = str(uuid.uuid4())
         script_key = f"outputs/{user_id}/{out_id}.txt"
         mp3_key = f"outputs/{user_id}/{out_id}.mp3"
+
         s3_put_bytes(script_key, script.encode("utf-8"), "text/plain; charset=utf-8")
         script_url = public_file_url(script_key)
+
         if audio_mp3:
             s3_put_bytes(mp3_key, audio_mp3, "audio/mpeg")
             mp3_url = public_file_url(mp3_key)
 
     return {
+        "lang": lang,
         "transcript": transcript,
         "script": script,
         "mp3_bytes": audio_mp3,
@@ -817,21 +1266,46 @@ async def telegram_webhook(secret: str, req: Request):
 
         pay_url = f"{S.public_base_url.rstrip('/')}/pay/tg/{chat_id}"
 
+        if data in ("lang_it", "lang_en"):
+            new_lang = "it" if data == "lang_it" else "en"
+            new_lang = set_chat_lang(chat_id, new_lang)
+            label = "🇮🇹 Italiano" if new_lang == "it" else "🇬🇧 English"
+            tg_send_message(
+                chat_id,
+                f"✅ Lingua impostata: {label}\n\nOra mandami un testo o un vocale 🎙️",
+                buttons=[
+                    [{"text": "➕ Nuovo podcast", "callback_data": "new"}],
+                    [{"text": "🇮🇹 Italiano", "callback_data": "lang_it"}, {"text": "🇬🇧 English", "callback_data": "lang_en"}],
+                    [{"text": "❓ Aiuto", "callback_data": "help"}],
+                ],
+            )
+            return {"ok": True}
+
         if data == "help":
+            cur = get_chat_lang(chat_id)
+            cur_label = "🇮🇹 Italiano" if cur == "it" else "🇬🇧 English"
             tg_send_message(
                 chat_id,
                 "💡 Invia un testo o un vocale.\n"
-                "Io genero uno script e (se TTS attivo) anche l’audio.\n",
+                "Io genero uno script e (se TTS attivo) anche l’audio.\n"
+                f"Lingua attuale: {cur_label}\n",
                 buttons=[
                     [{"text": "➕ Nuovo podcast", "callback_data": "new"}],
+                    [{"text": "🇮🇹 Italiano", "callback_data": "lang_it"}, {"text": "🇬🇧 English", "callback_data": "lang_en"}],
                     [{"text": "💳 Abbonati", "url": pay_url}],
                 ],
+
             )
         elif data == "new":
+            cur = get_chat_lang(chat_id)
+            cur_label = "🇮🇹 Italiano" if cur == "it" else "🇬🇧 English"
             tg_send_message(
                 chat_id,
-                "Ok! Mandami ora testo oppure un vocale 🎙️",
-                buttons=[[{"text": "❓ Aiuto", "callback_data": "help"}]],
+                f"Ok! Mandami ora testo oppure un vocale 🎙️\n(Lingua: {cur_label})",
+                buttons=[
+                    [{"text": "🇮🇹 Italiano", "callback_data": "lang_it"}, {"text": "🇬🇧 English", "callback_data": "lang_en"}],
+                    [{"text": "❓ Aiuto", "callback_data": "help"}],
+                ],
             )
         else:
             tg_send_message(
@@ -882,13 +1356,14 @@ async def telegram_webhook(secret: str, req: Request):
     # testo -> enqueue
     if text:
         tg_send_message(chat_id, "⏳ Ricevuto! Sto generando il podcast…", buttons=[[{"text": "❓ Aiuto", "callback_data": "help"}]])
-
+        lang = get_chat_lang(chat_id)
         job = {
             "channel": "telegram",
             "user_id": f"tg-{chat_id}",
             "chat_id": chat_id,
             "input_text": text,
             "input_audio_s3_key": "",
+            "lang": lang,
         }
         q.enqueue("worker.process_job", job)
         return {"ok": True}
@@ -910,13 +1385,14 @@ async def telegram_webhook(secret: str, req: Request):
 
         in_key = f"inputs/tg-{chat_id}/{uuid.uuid4()}.ogg"
         s3_put_bytes(in_key, audio_bytes, "audio/ogg")
-
+        lang = get_chat_lang(chat_id)
         job = {
             "channel": "telegram",
             "user_id": f"tg-{chat_id}",
             "chat_id": chat_id,
             "input_text": "",
             "input_audio_s3_key": in_key,
+            "lang": lang,
         }
         q.enqueue("worker.process_job", job)
         return {"ok": True}
@@ -925,6 +1401,301 @@ async def telegram_webhook(secret: str, req: Request):
     tg_send_message(chat_id, "Formato non riconosciuto. Invia testo o vocale.", buttons=[[{"text": "❓ Aiuto", "callback_data": "help"}]])
     return {"ok": True}
 
+# -----------------------------
+# Telegram: helpers (ADD ONCE in app.py)
+# -----------------------------
+def tg_send_document_bytes(
+    chat_id: str,
+    doc_bytes: bytes,
+    filename: str = "script.txt",
+    caption: str = "",
+    mime_type: str = "text/plain",
+) -> None:
+    """
+    Invia un documento a Telegram come upload multipart (non serve URL pubblico).
+    Perfetto per inviare lo script completo come .txt.
+    """
+    if not doc_bytes:
+        raise RuntimeError("tg_send_document_bytes: empty bytes")
+
+    payload = {"chat_id": chat_id, "caption": caption}
+    files = {"document": (filename, doc_bytes, mime_type)}
+    tg_api("sendDocument", payload=payload, files=files)
+
+def tg_send_audio_bytes(chat_id: str, audio_bytes: bytes, filename: str = "podcast.mp3", caption: str = "") -> None:
+    """
+    Invia audio a Telegram come upload multipart (non serve URL pubblico).
+    """
+    if not audio_bytes:
+        raise RuntimeError("tg_send_audio_bytes: empty audio bytes")
+
+    payload = {"chat_id": chat_id, "caption": caption}
+    files = {"audio": (filename, audio_bytes, "audio/mpeg")}
+    tg_api("sendAudio", payload=payload, files=files)
+
+def tg_send_voice_bytes(chat_id: str, mp3_bytes: bytes, caption: str = "") -> None:
+    """
+    Converte MP3 -> OGG/OPUS e invia come Telegram voice message (sendVoice).
+    Richiede ffmpeg nel container.
+    """
+    import os
+    import tempfile
+    import subprocess
+
+    if not mp3_bytes:
+        raise RuntimeError("tg_send_voice_bytes: empty mp3 bytes")
+
+    with tempfile.TemporaryDirectory() as td:
+        in_mp3 = os.path.join(td, "in.mp3")
+        out_ogg = os.path.join(td, "out.ogg")
+
+        with open(in_mp3, "wb") as f:
+            f.write(mp3_bytes)
+
+        # Telegram voice = OGG/OPUS
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", in_mp3,
+            "-vn",
+            "-ac", "1",
+            "-ar", "48000",
+            "-c:a", "libopus",
+            "-b:a", "32k",
+            out_ogg,
+        ]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            err = p.stderr.decode("utf-8", errors="ignore")
+            raise RuntimeError(f"ffmpeg mp3->opus failed: {err[:1600]}")
+
+        ogg_bytes = open(out_ogg, "rb").read()
+
+    payload = {"chat_id": chat_id, "caption": caption}
+    files = {"voice": ("voice.ogg", ogg_bytes, "audio/ogg")}
+    tg_api("sendVoice", payload=payload, files=files)
+
+def handle_telegram_update(update: Dict[str, Any]) -> None:
+    callback = update.get("callback_query") or {}
+    message = update.get("message") or {}
+
+    # -------------------------
+    # CALLBACK_QUERY (buttons)
+    # -------------------------
+    if callback:
+        msg = callback.get("message") or {}
+        chat_id = str((msg.get("chat") or {}).get("id") or "")
+        data = str(callback.get("data") or "").strip()
+        if not chat_id:
+            return
+
+        # Home
+        if data == "home":
+            tg_send_message(chat_id, t(chat_id, "start"), buttons=build_home_keyboard(chat_id))
+            return
+
+        # Language
+        if data in ("lang_it", "lang_en"):
+            new_lang = "it" if data == "lang_it" else "en"
+            new_lang = set_chat_lang(chat_id, new_lang)
+            label = "🇮🇹 Italiano" if new_lang == "it" else "🇬🇧 English"
+            tg_send_message(chat_id, t(chat_id, "lang_set", label=label), buttons=build_home_keyboard(chat_id))
+            return
+
+        # Help
+        if data == "help":
+            tg_send_message(chat_id, t(chat_id, "help"), buttons=build_home_keyboard(chat_id))
+            return
+
+        # New
+        if data == "new":
+            tg_send_message(chat_id, t(chat_id, "ask_input"), buttons=build_home_keyboard(chat_id))
+            return
+
+        # Voices main menu
+        if data == "voices":
+            tg_send_message(chat_id, t(chat_id, "voices_title"), buttons=build_voice_menu_keyboard(chat_id))
+            return
+
+        # Choose role menu
+        if data.startswith("voices_role:"):
+            role = data.split(":", 1)[1].strip()
+            if role not in ("narrator", "expert"):
+                tg_send_message(chat_id, t(chat_id, "unknown"), buttons=build_home_keyboard(chat_id))
+                return
+            tg_send_message(
+                chat_id,
+                t(chat_id, "voices_role", role_label=role_label(chat_id, role)),
+                buttons=build_voice_list_keyboard(chat_id, role),
+            )
+            return
+
+        # Save voice selection
+        if data.startswith("voice_set:"):
+            # voice_set:<role>:<voice_id>
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                tg_send_message(chat_id, t(chat_id, "unknown"), buttons=build_home_keyboard(chat_id))
+                return
+            role, voice_id = parts[1].strip(), parts[2].strip()
+            if role not in ("narrator", "expert"):
+                tg_send_message(chat_id, t(chat_id, "unknown"), buttons=build_home_keyboard(chat_id))
+                return
+
+            lang = get_chat_lang(chat_id)
+            set_chat_voice_id(chat_id, lang, role, voice_id)
+
+            tg_send_message(
+                chat_id,
+                t(chat_id, "saved_voice", role_label=role_label(chat_id, role), voice_id=voice_id),
+                buttons=build_voice_list_keyboard(chat_id, role),
+            )
+            return
+
+        # Preview voice (enqueue)
+        if data.startswith("voice_preview:"):
+            voice_id = data.split(":", 1)[1].strip()
+            lang = get_chat_lang(chat_id)
+            preview_text = build_preview_text(chat_id)
+
+            # short ack message (localized optional)
+            if lang == "en":
+                tg_send_message(chat_id, f"🎧 Preview: {voice_id}")
+            else:
+                tg_send_message(chat_id, f"🎧 Anteprima: {voice_id}")
+
+            q.enqueue(
+                "worker.process_preview_voice",
+                {
+                    "channel": "telegram",
+                    "chat_id": chat_id,
+                    "lang": lang,
+                    "voice_id": voice_id,
+                    "text": preview_text,
+                },
+            )
+            return
+        
+        tg_send_message(chat_id, t(chat_id, "unknown"), buttons=build_home_keyboard(chat_id))
+        return
+
+    # -------------------------
+    # MESSAGE (text / voice)
+    # -------------------------
+    chat_id = str((message.get("chat") or {}).get("id") or "")
+    if not chat_id:
+        return
+
+    text = (message.get("text") or "").strip()
+
+    if text.lower().startswith("/start"):
+        tg_send_message(chat_id, t(chat_id, "start"), buttons=build_home_keyboard(chat_id))
+        return
+
+    if not user_has_access(chat_id):
+        tg_send_message(chat_id, t(chat_id, "locked"), buttons=build_home_keyboard(chat_id))
+        return
+
+    if text:
+        tg_send_message(chat_id, t(chat_id, "received"), buttons=[[{"text": "❓ Help" if get_chat_lang(chat_id) == "en" else "❓ Aiuto", "callback_data": "help"}]])
+        lang = get_chat_lang(chat_id)
+        q.enqueue("worker.process_job", {
+            "channel": "telegram",
+            "user_id": f"tg-{chat_id}",
+            "chat_id": chat_id,
+            "input_text": text,
+            "input_audio_s3_key": "",
+            "lang": lang,
+        })
+        return
+
+    voice = message.get("voice") or {}
+    file_id = voice.get("file_id")
+    if file_id:
+        tg_send_message(chat_id, t(chat_id, "received_voice"), buttons=[[{"text": "❓ Help" if get_chat_lang(chat_id) == "en" else "❓ Aiuto", "callback_data": "help"}]])
+        audio_bytes, file_path = tg_get_file_bytes(file_id)
+
+        local_name = f"{uuid.uuid4()}_{os.path.basename(file_path)}"
+        local_path = os.path.join(S.data_dir, local_name)
+        with open(local_path, "wb") as f:
+            f.write(audio_bytes)
+
+        in_key = f"inputs/tg-{chat_id}/{uuid.uuid4()}.ogg"
+        s3_put_bytes(in_key, audio_bytes, "audio/ogg")
+        lang = get_chat_lang(chat_id)
+
+        q.enqueue("worker.process_job", {
+            "channel": "telegram",
+            "user_id": f"tg-{chat_id}",
+            "chat_id": chat_id,
+            "input_text": "",
+            "input_audio_s3_key": in_key,
+            "lang": lang,
+        })
+        return
+
+    tg_send_message(chat_id, t(chat_id, "bad_format"), buttons=build_home_keyboard(chat_id))
+
+async def telegram_polling_loop():
+    """
+    Long polling loop:
+    - legge offset da Redis (persistente)
+    - chiama getUpdates con timeout lungo
+    - per ogni update chiama handle_telegram_update()
+    """
+    if not S.telegram_bot_token:
+        log.warning("TELEGRAM_BOT_TOKEN missing: polling disabled")
+        return
+
+    # Persistiamo offset su Redis, così se riavvii non riprendi vecchi update
+    offset_key = S.telegram_offset_key
+
+    # Inizializza offset
+    try:
+        raw = redis_conn.get(offset_key)
+        offset = int((raw or b"0").decode("utf-8") or "0")
+    except Exception:
+        offset = 0
+
+    log.info("Telegram polling started. offset=%s timeout=%s", offset, S.telegram_poll_timeout)
+
+    while True:
+        try:
+            data = tg_api_get(
+                "getUpdates",
+                params={"timeout": S.telegram_poll_timeout, "offset": offset, "allowed_updates": ["message", "callback_query"]},
+            )
+            updates = data.get("result") or []
+
+            for upd in updates:
+                upd_id = int(upd.get("update_id", 0))
+                offset = max(offset, upd_id + 1)
+
+                # salva offset subito (robusto)
+                try:
+                    redis_conn.set(offset_key, str(offset))
+                except Exception:
+                    pass
+
+                # gestisci update (sincrona) senza bloccare troppo l'event loop
+                await asyncio.to_thread(handle_telegram_update, upd)
+
+            if not updates:
+                await asyncio.sleep(S.telegram_poll_sleep)
+
+        except Exception as e:
+            log.exception("Polling error: %s", e)
+            await asyncio.sleep(2.0)
+
+
+@app.on_event("startup")
+async def _startup_tasks():
+    # Se siamo in modalità polling, avvia loop
+    if S.telegram_mode == "polling":
+        asyncio.create_task(telegram_polling_loop())
+        log.info("Telegram mode=polling")
+    else:
+        log.info("Telegram mode=webhook")
 
 # -----------------------------
 # Stripe endpoints
@@ -984,9 +1755,9 @@ def stripe_cancel():
 # -----------------------------
 # Gradio demo (mounted)
 # -----------------------------
-def gradio_generate(text: str, audio_file, user_id: str):
+def gradio_generate(text: str, audio_file, user_id: str, lang: str):
     """
-    Gradio handler:
+    Gradio handler (bilingue):
     - se c'è audio: lo carica su S3 e usa SOLO STT
     - altrimenti usa text
     - mostra transcript e script
@@ -996,19 +1767,15 @@ def gradio_generate(text: str, audio_file, user_id: str):
     import uuid
 
     user_id = (user_id or "demo").strip() or "demo"
+    lang = normalize_lang(lang)
 
     audio_key = ""
     source_text = (text or "").strip()
 
-    # Se ho audio, ignoro il testo (evita "tema di default" / placeholder)
     if audio_file:
         source_text = ""
-
-        # audio_file è filepath (type="filepath")
         with open(audio_file, "rb") as f:
             audio_bytes = f.read()
-
-        # Salviamo il vocale su S3/MinIO così la pipeline lo scarica e fa STT
         audio_key = f"inputs/{user_id}/{uuid.uuid4()}.ogg"
         s3_put_bytes(audio_key, audio_bytes, "audio/ogg")
 
@@ -1016,6 +1783,8 @@ def gradio_generate(text: str, audio_file, user_id: str):
         user_id=user_id,
         input_text=source_text,
         input_audio_s3_key=audio_key,
+        lang=lang,
+        chat_id=chat_id,
     )
 
     transcript = out.get("transcript", "")
@@ -1029,13 +1798,14 @@ def gradio_generate(text: str, audio_file, user_id: str):
         with open(audio_path, "wb") as f:
             f.write(mp3_bytes)
 
-    # Outputs: transcript, script, audio
     return transcript, script, audio_path
 
 with gr.Blocks() as demo:
     gr.Markdown("# Podcast Generator (Narratrice + Esperto)")
 
     user_id_in = gr.Textbox(value="demo", label="User ID")
+
+    lang_in = gr.Dropdown(choices=["it", "en"], value=S.podcast_default_lang, label="Language (IT/EN)")
 
     text_in = gr.Textbox(lines=6, label="Testo (opzionale, ignorato se invii un vocale)", value="")
     audio_in = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Vocale (opzionale)")
@@ -1045,10 +1815,9 @@ with gr.Blocks() as demo:
     transcript_out = gr.Textbox(lines=6, label="Transcript (STT)")
     script_out = gr.Textbox(lines=14, label="Script generato")
     audio_out = gr.Audio(type="filepath", label="Audio (MP3)")
-
     btn.click(
         fn=gradio_generate,
-        inputs=[text_in, audio_in, user_id_in],
+        inputs=[text_in, audio_in, user_id_in, lang_in],
         outputs=[transcript_out, script_out, audio_out],
     )
 
